@@ -197,7 +197,6 @@ class StreamWriter:
                     else:
                         shard_shape = self._get_shard_shape(shape, data_kind=DataKind.TRACE)
                     chunk_shape = self._get_chunk_shape() + (readout.shape[0],)
-                    print(readout.name, shard_shape, chunk_shape)
                 
                 case _:
                     raise NotImplementedError(f"Unsupported measurement kind: {readout.kind}")
