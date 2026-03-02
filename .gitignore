@@ -1,0 +1,28 @@
+# Other files and folders
+.settings/
+.vscode/
+*egg-info/
+build/
+dev/
+*data/
+zeroheliumkit/eeroq/
+_autosummary/
+
+*.DS_Store
+*.ipynb_checkpoints
+*.pickle
+*.txt
+*.db
+*.pyc
+*.sh
+*.msh2
+*.gds
+*__pycache__
+  
+# AutoCAD work files
+*.dw*
+*.dxf
+*.bak
+
+# exceptions
+!requirements.txt

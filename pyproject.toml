@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zarro"
+version = "0.0.1"
+description = "A python package to handle data saving in experiments using zarr"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [
+    {name="Niyaz Beysengulov", email="nbeysengulov@eeroq.com"},
+]
+
+[project.urls]
+Homepage = "https://github.com/eeroqlab/zarro"
+
+[tool.setuptools.packages.find]
+where = ["src"]
