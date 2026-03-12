@@ -25,10 +25,11 @@ class ControlVar:
     name: str
     values: np.ndarray
     unit: Optional[str] = None
+    instrument: Optional[str] = None  # Optional field to specify the instrument/source of the control variable
 
 
 @dataclass(slots=True)
-class AxisSpec:
+class AxisSpecs:
     """
     Defines a control axis for the measurement schema, consisting of one or more control variables that share the same length (number of points).
    
@@ -51,7 +52,7 @@ class AxisSpec:
 
 
 @dataclass(slots=True)
-class ReadoutSpec:
+class ReadoutSpecs:
     name: str
     kind: DataKind
     unit: Optional[str] = None
@@ -70,8 +71,8 @@ class MeasurementSchema:
         writetype: specifies the expected write pattern for the data, which can be used to optimize chunking and sharding strategies.
             For example, if writetype is POINTWISE, the writer can optimize for individual point writes.
     """
-    control: list[AxisSpec]
-    measure: list[ReadoutSpec]
+    control: list[AxisSpecs]
+    measure: list[ReadoutSpecs]
     writetype: WriteType = WriteType.POINTWISE
 
     @property
@@ -115,7 +116,7 @@ def compute_sharding(shape: tuple[int, ...], num_shards: int) -> tuple[int, ...]
 
 
 @dataclass
-class StreamWriter:
+class ZarrWriter:
     """
     Generalized streaming writer for multi-dimensional parameter sweeps with mixed scalar/trace readouts, using Zarr v3 sharding.
 
@@ -127,7 +128,7 @@ class StreamWriter:
         overwrite: if True, existing data will be overwritten; otherwise, it will be preserved and verified for consistency
 
     Example usage:
-    writer = StreamWriter(
+    writer = ZarrWriter(
         root="path/to/data",
         experiment_id="exp_001",
         schema=mschema,
@@ -366,3 +367,80 @@ class StreamWriter:
         )
         arr[:] = value
         self._dataset_map[name] = arr
+
+
+@dataclass
+class NpzWriter:
+
+    """Simple writer that saves data as .npz files, organized by control axis values. Not optimized for large datasets or complex schemas."""
+    root: str | Path
+    schema: MeasurementSchema
+    tags: list[str] = field(default_factory=list)
+
+    #Behavior
+    overwrite: bool = True
+    compressed: bool = True
+
+    # Not user controlled
+    _control_shape: tuple[int, ...] = field(init=False)
+
+    def __post_init__(self):
+        self.root = Path(self.root)
+        self.root.mkdir(parents=True, exist_ok=True)
+
+        self._control_shape = tuple(ax.length for ax in self.schema.control)
+
+
+    def write(self, data: dict[str, np.ndarray]):
+        filename = self.root / f"data.npz"
+        if self.overwrite and filename.exists():
+            filename.unlink()  # Remove existing file if overwrite is True
+        if self.compressed:
+            np.savez_compressed(filename, **data)
+        else:
+            np.savez(filename, **data)
+
+
+    def write_metadata(self):
+        metadata_path = self.root / "metadata.yaml"
+        metadata = {
+            "version": None,
+            "axis": self.schema.axis_names,
+            "readout": self.schema.readout_names,
+            "schema": self._control_shape,
+            "notes": "This is a simple NPZ writer; not optimized for large datasets.",
+        }
+        metadata_path.write_text(yaml.safe_dump(metadata, sort_keys=False))
+
+
+    def write_summary(self):
+        summary_path = self.root / "summary.txt"
+
+        with open(summary_path, "w") as f:
+            f.write("Experiment Summary\n")
+            f.write("------------------\n")
+
+            f.write(f'\n{len(self.data)} measurements made.')
+
+            f.write('\n')
+
+            f.write(f'\nTags:')
+            for tag in self.tags:
+                f.write(f'   \n{tag}')
+
+            f.write('\n')
+
+            f.write('\nControl Axes:')
+            for iax, ax in enumerate(self.schema.control):
+                f.write(f'\n   Axis {iax}:')
+                for ctrl in ax.controls:
+                    f.write(f'\n      {ctrl.name} swept between {ctrl.values[0]:.3e} and {ctrl.values[-1]:.3e}')
+
+            f.write('\n')
+
+
+            f.write('\nMeasured:')
+            for ro in self.schema.readout:
+                f.write(f'\n   {ro.name} [{ro.unit}] of shape {ro.shape} stored')
+
+            f.write('\n')
