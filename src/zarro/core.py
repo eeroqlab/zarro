@@ -69,6 +69,7 @@ class ReadoutSpecs:
     kind: DataKind
     unit: Optional[str] = None
     shape: Optional[tuple[int, ...]] = None  # For trace/array data, specify the shape of the trailing dimensions (e.g. trace length or image height/width)
+    contains: Optional[str] = None
 
 
 @dataclass(slots=True)
@@ -84,19 +85,32 @@ class MeasurementSchema:
             For example, if writetype is POINTWISE, the writer can optimize for individual point writes.
     """
     control: list[AxisSpecs]
-    measure: list[ReadoutSpecs]
+    readout: list[ReadoutSpecs]
     writetype: WriteType = WriteType.POINTWISE
+    meta: dict = field(init=False)
 
     @property
     def axis_names(self) -> list[str]:
-        axis_names = {}
-        for i, axis in enumerate(self.control[::-1]):
-            axis_names["axis" + str(i) + " / " + str(axis.length)] = axis.names
-        return axis_names
+        names = {}
+        for i, axis in enumerate(self.control):
+            names["axis" + str(i)] = axis.names
+        return names
     
     @property
     def readout_names(self) -> list[str]:
-        return [r.name for r in self.measure]
+        return [r.name for r in self.readout]
+    
+    def __post_init__(self):
+        readout_meta = {}
+        for r in self.readout:
+            specs = asdict(r)
+            specs.pop("name")
+            readout_meta[r.name] = specs
+
+        self.meta = {
+            "control": self.axis_names,
+            "readout": readout_meta
+        }
 
 
 def compute_sharding(shape: tuple[int, ...], num_shards: int) -> tuple[int, ...]:
@@ -142,7 +156,6 @@ class ZarrWriter:
     Example usage:
     writer = ZarrWriter(
         root="path/to/data",
-        experiment_id="exp_001",
         schema=mschema,
         target_file_size_bytes=1 * 1024 * 1024,  # target ~1MB shards; adjust as needed
         overwrite=True,
@@ -150,13 +163,12 @@ class ZarrWriter:
     """
 
     root: str | Path
-    experiment_id: str
-    schema: MeasurementSchema
+    schema: Optional[MeasurementSchema] = None
     tags: list[str] = field(default_factory=list)
 
     # Behavior
     overwrite: bool = False
-    initialize_arrays: bool = True  # Whether to create Zarr arrays at initialization based on the schema. If False, arrays can be created later using add_array().
+    initialize_arrays: bool = False  # Whether to create Zarr arrays at initialization based on the schema. If False, arrays can be created later using add_array().
     target_file_size_bytes: int = 5 * 1024 * 1024  # target ~5MB shards; adjust as needed
 
     # Not user controlled
@@ -164,13 +176,14 @@ class ZarrWriter:
     _dataset_map: dict[str, zarr.Array] = field(init=False)
 
     def __post_init__(self):
-        self.root = Path(self.root) / Path(self.experiment_id)
+        self.root = Path(self.root)
         self.root.mkdir(parents=True, exist_ok=True)
 
         # Local filesystem store (works on NAS paths)
         self.vault = zarr.group(str(self.root / "vault.zarr"))
 
-        self._control_shape = tuple(ax.length for ax in self.schema.control)
+        if self.schema is not None:
+            self._control_shape = tuple(ax.length for ax in self.schema.control)
         self._dataset_map = {}
 
         if self.initialize_arrays:
@@ -368,17 +381,16 @@ class ZarrWriter:
         if metadata_path.exists() and not self.overwrite:
             return
         
-        metadata = {
-            "control": self.schema.axis_names,
-            "readout": self.schema.readout_names,
-            "tags": self.tags
-        }
+        metadata = {"tags": self.tags}
+        if self.schema is not None:    
+            metadata |= self.schema.meta 
         if meta:
             metadata |= meta  # Merge additional metadata if provided
-        metadata_path.write_text(yaml.safe_dump(metadata, sort_keys=False))
+
+        metadata_path.write_text(yaml.safe_dump(serialize(metadata), sort_keys=False))
 
 
-    def write_metadata(self, meta: dict[str, str] = None):
+    def write_metadata(self, meta: dict = None):
         """
         Write experiment metadata as Zarr group attributes. This can include control axis names, readout names,
         and any additional metadata provided by the user.
@@ -390,9 +402,8 @@ class ZarrWriter:
                 This can be used to add custom metadata fields beyond the standard control and readout information.
         """
         metadata = {
-            "date": "2026-02-24",
-            "experiment_id": self.experiment_id,
-            "schema": asdict(self.schema),
+            "date": str(self.root),
+            "schema": self.schema.meta if self.schema is not None else "none",
             "tags": self.tags
         }
         if meta:
@@ -430,12 +441,12 @@ class NpzWriter:
 
     """Simple writer that saves data as .npz files, organized by control axis values. Not optimized for large datasets or complex schemas."""
     root: str | Path
-    schema: MeasurementSchema
+    schema: Optional[MeasurementSchema] = None
     tags: list[str] = field(default_factory=list)
 
     #Behavior
-    overwrite: bool = True
-    compressed: bool = True
+    overwrite: bool = False
+    compressed: bool = False
 
     # Not user controlled
     _control_shape: tuple[int, ...] = field(init=False)
@@ -444,7 +455,8 @@ class NpzWriter:
         self.root = Path(self.root)
         self.root.mkdir(parents=True, exist_ok=True)
 
-        self._control_shape = tuple(ax.length for ax in self.schema.control)
+        if self.schema is not None:
+            self._control_shape = tuple(ax.length for ax in self.schema.control)
 
 
     def write(self, data: dict[str, np.ndarray]):
@@ -457,16 +469,16 @@ class NpzWriter:
             np.savez(filename, **data)
 
 
-    def write_metadata(self, add_meta: dict[str, str] = None):
+    def write_metadata(self, meta: dict = None):
         metadata_path = self.root / "metadata.yaml"
-        metadata = {
-            "axis": self.schema.axis_names,
-            "readout": self.schema.readout_names,
-            "schema": self._control_shape
-        }
-        if add_meta:
-            metadata |= add_meta  # Merge additional metadata if provided
-        metadata_path.write_text(yaml.safe_dump(metadata, sort_keys=False))
+        
+        metadata = {"tags": self.tags}
+        if self.schema is not None:    
+            metadata |= self.schema.meta 
+        if meta:
+            metadata |= meta  # Merge additional metadata if provided
+
+        metadata_path.write_text(yaml.safe_dump(serialize(metadata), sort_keys=False))
 
 
     def write_summary(self):
