@@ -2,18 +2,20 @@ from .core import (
     DataKind,
     WriteType,
     ControlVar,
-    AxisSpec,
-    ReadoutSpec,
+    AxisSpecs,
+    ReadoutSpecs,
     MeasurementSchema,
-    StreamWriter
+    ZarrWriter,
+    NpzWriter
 )
 
 __all__ = [
     "DataKind",
     "WriteType",
     "ControlVar",
-    "AxisSpec",
-    "ReadoutSpec",
+    "AxisSpecs",
+    "ReadoutSpecs",
     "MeasurementSchema",
-    "StreamWriter"
+    "ZarrWriter",
+    "NpzWriter"
 ]

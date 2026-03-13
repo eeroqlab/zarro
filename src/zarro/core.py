@@ -144,6 +144,7 @@ class ZarrWriter:
 
     # Behavior
     overwrite: bool = False
+    initialize_arrays: bool = True  # Whether to create Zarr arrays at initialization based on the schema. If False, arrays can be created later using add_array().
 
     # Not user controlled
     _control_shape: tuple[int, ...] = field(init=False)
@@ -159,12 +160,12 @@ class ZarrWriter:
         self._control_shape = tuple(ax.length for ax in self.schema.control)
         self._dataset_map = {}
 
-        # Create/open arrays
-        self._init_coord_arrays()
-        self._init_data_arrays()
-
-        # Write a small manifest (you can expand with full experiment metadata)
-        self._write_metadata()
+        if self.initialize_arrays:
+            # Create/open arrays
+            self._init_coord_arrays()
+            self._init_data_arrays()
+            # Write a small manifest (you can expand with full experiment metadata)
+            self.write_metadata()
 
 
     def _init_coord_arrays(self):
@@ -338,14 +339,14 @@ class ZarrWriter:
             raise ValueError(f"Dataset '{name}' expects shape {expected_shape} but got {value.shape}")
 
 
-    def _write_metadata(self):
+    def write_metadata(self):
         metadata_path = self.root / "metadata.yaml"
         if metadata_path.exists() and not self.overwrite:
             return
 
         metadata = {
-            "experiment_id": self.experiment_id,
             "date": "2026-02-24",
+            "experiment_id": self.experiment_id,
             "axis": self.schema.axis_names,
             "readout": self.schema.readout_names,
             "notes": "S21 stored as re/im derived from mag/phase.",
@@ -355,7 +356,7 @@ class ZarrWriter:
 
     def add_array(self, name: str, value: np.ndarray, meta: dict[str] = None):
         """Add a new array to the vault after initialization. Useful for adding derived datasets."""
-        if name in self._dataset_map:
+        if name in self._dataset_map and not self.overwrite:
             raise KeyError(f"Dataset '{name}' already exists")
 
         arr = self.vault.create_array(
@@ -367,6 +368,11 @@ class ZarrWriter:
         )
         arr[:] = value
         self._dataset_map[name] = arr
+
+
+    def write_npzlike(self, data: dict[str, np.ndarray], meta: dict[str, dict] = None):
+        for key, value in data.items():
+            self.add_array(name=key, value=value, meta=meta)
 
 
 @dataclass
@@ -401,15 +407,15 @@ class NpzWriter:
             np.savez(filename, **data)
 
 
-    def write_metadata(self):
+    def write_metadata(self, add_meta: dict[str, str] = None):
         metadata_path = self.root / "metadata.yaml"
         metadata = {
-            "version": None,
             "axis": self.schema.axis_names,
             "readout": self.schema.readout_names,
-            "schema": self._control_shape,
-            "notes": "This is a simple NPZ writer; not optimized for large datasets.",
+            "schema": self._control_shape
         }
+        if add_meta:
+            metadata |= add_meta  # Merge additional metadata if provided
         metadata_path.write_text(yaml.safe_dump(metadata, sort_keys=False))
 
 
