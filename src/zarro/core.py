@@ -1,11 +1,23 @@
 import yaml
 import numpy as np
 import zarr
+import json
 
 from enum import StrEnum
 from typing import Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
+
+
+def encode_value(x):
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+    # other special cases... 
+    return x
+
+
+def serialize(x):
+    return json.loads(json.dumps(x, default=encode_value))
 
 
 class DataKind(StrEnum):
@@ -140,11 +152,12 @@ class ZarrWriter:
     root: str | Path
     experiment_id: str
     schema: MeasurementSchema
-    target_file_size_bytes: int = 5 * 1024 * 1024  # target ~100MB shards; adjust as needed
+    tags: list[str] = field(default_factory=list)
 
     # Behavior
     overwrite: bool = False
     initialize_arrays: bool = True  # Whether to create Zarr arrays at initialization based on the schema. If False, arrays can be created later using add_array().
+    target_file_size_bytes: int = 5 * 1024 * 1024  # target ~5MB shards; adjust as needed
 
     # Not user controlled
     _control_shape: tuple[int, ...] = field(init=False)
@@ -165,7 +178,7 @@ class ZarrWriter:
             self._init_coord_arrays()
             self._init_data_arrays()
             # Write a small manifest (you can expand with full experiment metadata)
-            self.write_metadata()
+            self.write_yaml()
 
 
     def _init_coord_arrays(self):
@@ -311,15 +324,19 @@ class ZarrWriter:
             
             arr[index_tuple] = value
 
+
     def write_point(self, index: tuple[int, ...], data: dict[str, np.ndarray]):
        self._write(index, data, writetype=WriteType.POINTWISE)
 
+
     def write_trace(self, index: tuple[int, ...], data: dict[str, np.ndarray]):
         self._write(index, data, writetype=WriteType.TRACEWISE)
-    
+
+
     def write_image(self, index: tuple[int, ...], data: dict[str, np.ndarray]):
         self._write(index, data, writetype=WriteType.IMAGEWISE)
-    
+
+
     def write_all(self, data: dict[str, np.ndarray]):
         # Write each dataset
         for name, value in data.items():
@@ -339,25 +356,58 @@ class ZarrWriter:
             raise ValueError(f"Dataset '{name}' expects shape {expected_shape} but got {value.shape}")
 
 
-    def write_metadata(self):
+    def write_yaml(self, meta: dict[str, str] = None):
+        """Write a simple YAML manifest with experiment metadata, including control axis names and readout names.
+        This is separate from the Zarr attributes and can be used for quick inspection or compatibility with other tools.
+        
+        Args:
+            meta: additional metadata to include in the YAML file, as a dictionary of key-value pairs.
+            This can be used to add custom metadata fields beyond the standard control and readout information.
+        """
         metadata_path = self.root / "metadata.yaml"
         if metadata_path.exists() and not self.overwrite:
             return
+        
+        metadata = {
+            "control": self.schema.axis_names,
+            "readout": self.schema.readout_names,
+            "tags": self.tags
+        }
+        if meta:
+            metadata |= meta  # Merge additional metadata if provided
+        metadata_path.write_text(yaml.safe_dump(metadata, sort_keys=False))
 
+
+    def write_metadata(self, meta: dict[str, str] = None):
+        """
+        Write experiment metadata as Zarr group attributes. This can include control axis names, readout names,
+        and any additional metadata provided by the user.
+        Zarr attributes are stored as JSON-serializable key-value pairs and can be accessed programmatically when reading the Zarr group,
+        making them useful for storing structured metadata alongside the data arrays. 
+
+        Args:
+            meta: additional metadata to include in the Zarr attributes, as a dictionary of key-value pairs.
+                This can be used to add custom metadata fields beyond the standard control and readout information.
+        """
         metadata = {
             "date": "2026-02-24",
             "experiment_id": self.experiment_id,
-            "axis": self.schema.axis_names,
-            "readout": self.schema.readout_names,
-            "notes": "S21 stored as re/im derived from mag/phase.",
+            "schema": asdict(self.schema),
+            "tags": self.tags
         }
-        metadata_path.write_text(yaml.safe_dump(metadata))
+        if meta:
+            metadata |= meta  # Merge additional metadata if provided
+        metadata = serialize(metadata)
+        self.vault.attrs.put(metadata)  # Store metadata as a single JSON string in Zarr attributes; can be parsed back into structured form when reading
+        self.write_yaml(meta)  # Also write a human-readable YAML manifest
 
 
-    def add_array(self, name: str, value: np.ndarray, meta: dict[str] = None):
+    def add_array(self, name: str, value: np.ndarray | list, meta: dict[str] = None):
         """Add a new array to the vault after initialization. Useful for adding derived datasets."""
         if name in self._dataset_map and not self.overwrite:
             raise KeyError(f"Dataset '{name}' already exists")
+
+        value = np.asarray(value)
 
         arr = self.vault.create_array(
             name=name,
