@@ -147,11 +147,15 @@ class ZarrWriter:
     Generalized streaming writer for multi-dimensional parameter sweeps with mixed scalar/trace readouts, using Zarr v3 sharding.
 
     Args:
-        root: directory to store the Zarr and metadata
-        experiment_id: unique ID for this experiment/run
-        schema: defines the control axes and readout specifications. Must be provided by the user to define the structure of the data.
-        target_file_size_bytes: desired shard file size in bytes (default 1MB); used to compute shard shapes for trace/array data
-        overwrite: if True, existing data will be overwritten; otherwise, it will be preserved and verified for consistency
+        root: directory to store the Zarr and metadata files. The Zarr group will be created at root/vault.zarr.
+        schema (Optional[MeasurementSchema]): defines the control axes and readout specifications.
+            The writer uses this schema to initialize the Zarr arrays and
+            optimize chunking/sharding strategies based on the writetype.
+        tags (list[str]): optional list of tags to categorize or annotate the measurement.
+        target_file_size_bytes (int): desired shard file size in bytes (default 1MB); used to compute shard shapes for trace/array data
+        overwrite (bool): if True, existing data will be overwritten; otherwise, it will be preserved and verified for consistency
+        initialize_arrays (bool): if True, Zarr arrays will be created at initialization based on the schema.
+            If False, arrays can be created later using add_array(). Default is false.
 
     Example usage:
     writer = ZarrWriter(
@@ -173,7 +177,6 @@ class ZarrWriter:
 
     # Not user controlled
     _control_shape: tuple[int, ...] = field(init=False)
-    _dataset_map: dict[str, zarr.Array] = field(init=False)
 
     def __post_init__(self):
         self.root = Path(self.root)
@@ -184,7 +187,6 @@ class ZarrWriter:
 
         if self.schema is not None:
             self._control_shape = tuple(ax.length for ax in self.schema.control)
-        self._dataset_map = {}
 
         if self.initialize_arrays:
             # Create/open arrays
@@ -210,7 +212,7 @@ class ZarrWriter:
     def _init_data_arrays(self):
         """Initialize data arrays for measurement readouts."""
 
-        for readout in self.schema.measure:
+        for readout in self.schema.readout:
             
             match readout.kind:
                 case DataKind.SCALAR:
@@ -237,7 +239,6 @@ class ZarrWriter:
                 dtype="float32",
                 overwrite=self.overwrite,
             )
-            self._dataset_map[readout.name] = arr
 
 
     def _get_chunk_shape(self) -> tuple[int, ...]:
@@ -312,14 +313,14 @@ class ZarrWriter:
         if len(index) != len(self._control_shape) - num_slices:
             raise ValueError(f"index length {len(index)} does not match control dims {len(self._control_shape) - 1}")
     
-        datakind_by_name = {r.name: r.kind for r in self.schema.measure}
+        datakind_by_name = {r.name: r.kind for r in self.schema.readout}
 
         # Write each dataset
         for name, value in data.items():
-            if name not in self._dataset_map:
+            if name not in self.vault:
                 raise KeyError(f"Unknown dataset '{name}'")
             
-            arr = self._dataset_map[name]
+            arr = self.vault[name]
             value = np.asarray(value, dtype=arr.dtype)
 
             match datakind_by_name[name]:
@@ -353,10 +354,10 @@ class ZarrWriter:
     def write_all(self, data: dict[str, np.ndarray]):
         # Write each dataset
         for name, value in data.items():
-            if name not in self._dataset_map:
+            if name not in self.vault:
                 raise KeyError(f"Unknown dataset '{name}'")
             
-            arr = self._dataset_map[name]
+            arr = self.vault[name]
             value = np.asarray(value, dtype=arr.dtype)
             self._check_input_shape(value, arr.shape, name)
 
@@ -415,7 +416,7 @@ class ZarrWriter:
 
     def add_array(self, name: str, value: np.ndarray | list, meta: dict[str] = None):
         """Add a new array to the vault after initialization. Useful for adding derived datasets."""
-        if name in self._dataset_map and not self.overwrite:
+        if name in self.vault and not self.overwrite:
             raise KeyError(f"Dataset '{name}' already exists")
 
         value = np.asarray(value)
@@ -428,7 +429,6 @@ class ZarrWriter:
             attributes=meta
         )
         arr[:] = value
-        self._dataset_map[name] = arr
 
 
     def write_npzlike(self, data: dict[str, np.ndarray], meta: dict[str, dict] = None):
@@ -479,36 +479,3 @@ class NpzWriter:
             metadata |= meta  # Merge additional metadata if provided
 
         metadata_path.write_text(yaml.safe_dump(serialize(metadata), sort_keys=False))
-
-
-    def write_summary(self):
-        summary_path = self.root / "summary.txt"
-
-        with open(summary_path, "w") as f:
-            f.write("Experiment Summary\n")
-            f.write("------------------\n")
-
-            f.write(f'\n{len(self.data)} measurements made.')
-
-            f.write('\n')
-
-            f.write(f'\nTags:')
-            for tag in self.tags:
-                f.write(f'   \n{tag}')
-
-            f.write('\n')
-
-            f.write('\nControl Axes:')
-            for iax, ax in enumerate(self.schema.control):
-                f.write(f'\n   Axis {iax}:')
-                for ctrl in ax.controls:
-                    f.write(f'\n      {ctrl.name} swept between {ctrl.values[0]:.3e} and {ctrl.values[-1]:.3e}')
-
-            f.write('\n')
-
-
-            f.write('\nMeasured:')
-            for ro in self.schema.readout:
-                f.write(f'\n   {ro.name} [{ro.unit}] of shape {ro.shape} stored')
-
-            f.write('\n')

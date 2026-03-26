@@ -18,3 +18,7 @@ Homepage = "https://github.com/eeroqlab/zarro"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts   = "-v"

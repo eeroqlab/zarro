@@ -1,4 +1,4 @@
-from .core import (
+from .core2 import (
     DataKind,
     WriteType,
     ControlVar,
