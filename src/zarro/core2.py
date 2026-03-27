@@ -73,9 +73,9 @@ class AxisSpecs:
 class ReadoutSpecs:
     name: str
     kind: DataKind
-    unit: Optional[str] = None
+    unit: Optional[str | list[str]] = None
     shape: Optional[tuple[int, ...]] = None  # For trace/array data, specify the shape of the trailing dimensions (e.g. trace length or image height/width)
-    contains: Optional[str] = None
+    contains: Optional[str | list[str]] = None
 
 
 @dataclass(slots=True)
@@ -117,6 +117,43 @@ class MeasurementSchema:
             "control": self.axis_names,
             "readout": readout_meta
         }
+
+
+@dataclass
+class ExperimentID:
+    root: Path | str
+    
+    def __post_init__(self):
+        self.root = Path(self.root)
+        self.root.mkdir(parents=True, exist_ok=True)
+    
+    def get_folders(self):
+        # Use a list comprehension to filter directories
+        return [x for x in self.root.iterdir() if x.is_dir()]
+
+    def current_id(self):
+        folders = self.get_folders()
+        counter = len(folders)
+        if counter > 0:
+            counter = max(counter, int(folders[-1].name[:4]))
+        return counter
+    
+    def next_id(self):
+        return self.current_id() + 1   
+
+    def next_dir(self):
+        name = str(self.next_id()).rjust(4, "0")
+        return self.root / Path(name)
+    
+    def current_dir(self):
+        name = str(self.current_id()).rjust(4, "0")
+        return self.root / Path(name)
+    
+    def get_dir_name(self, id: int | str):
+        if isinstance(id, str):
+            return self.root / Path(id)
+        else:
+            return self.root / Path(str(id).rjust(4, "0"))
 
 
 def compute_sharding(shape: tuple[int, ...], num_shards: int) -> tuple[int, ...]:
@@ -463,7 +500,7 @@ class ZarrWriter:
         arr[:] = value
 
 
-    def write_npzlike(self, data: dict[str, np.ndarray], meta: dict[str, dict] = None):
+    def dump(self, data: dict[str, np.ndarray], meta: dict[str, dict] = None):
         self.vault.attrs.put(meta if meta else {})  # Store per-array metadata in a separate attribute; can be accessed when reading to understand the structure of the data
         for key, value in data.items():
             self.add_array(name=key, value=value)

@@ -6,7 +6,8 @@ from .core2 import (
     ReadoutSpecs,
     MeasurementSchema,
     ZarrWriter,
-    NpzWriter
+    NpzWriter,
+    ExperimentID
 )
 
 __all__ = [
@@ -17,5 +18,6 @@ __all__ = [
     "ReadoutSpecs",
     "MeasurementSchema",
     "ZarrWriter",
-    "NpzWriter"
+    "NpzWriter",
+    "ExperimentID"
 ]
