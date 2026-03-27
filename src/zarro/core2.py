@@ -272,7 +272,7 @@ class ZarrWriter:
                     else:
                         shard_shape = self._get_shard_shape(shape, data_kind=DataKind.TRACE)
                     chunk_shape = self._get_chunk_shape() + (readout.shape[0],)
-
+                    
                 # FIX: IMAGE was previously unhandled (raised NotImplementedError)
                 case DataKind.IMAGE:
                     shape = self._control_shape + readout.shape  # readout.shape is (H, W)
@@ -500,7 +500,7 @@ class ZarrWriter:
         arr[:] = value
 
 
-    def dump(self, data: dict[str, np.ndarray], meta: dict[str, dict] = None):
+    def dump(self, data: dict, meta: dict = None):
         self.vault.attrs.put(meta if meta else {})  # Store per-array metadata in a separate attribute; can be accessed when reading to understand the structure of the data
         for key, value in data.items():
             self.add_array(name=key, value=value)
