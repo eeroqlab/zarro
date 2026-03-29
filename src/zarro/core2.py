@@ -40,11 +40,19 @@ class ControlVar:
     name: str
     values: np.ndarray
     unit: Optional[str] = None
+    reverse: Optional[bool] = False  # Whether the control variable is swept backwards (e.g. for hysteresis measurements); this is just metadata and does not affect the order of values in the array
     instrument: Optional[str] = None  # Optional field to specify the instrument/source of the control variable
     
     @property
     def length(self):
         return len(self.values)
+    
+    def __post_init__(self):
+        if self.reverse:
+            extended_values = np.zeros(2 * self.length)
+            extended_values[:self.length] = self.values
+            extended_values[self.length:] = self.values[::-1]
+            self.values = extended_values
 
 
 @dataclass(slots=True)
