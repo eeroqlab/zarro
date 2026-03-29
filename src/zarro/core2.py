@@ -41,6 +41,10 @@ class ControlVar:
     values: np.ndarray
     unit: Optional[str] = None
     instrument: Optional[str] = None  # Optional field to specify the instrument/source of the control variable
+    
+    @property
+    def length(self):
+        return len(self.values)
 
 
 @dataclass(slots=True)
