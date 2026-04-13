@@ -561,3 +561,125 @@ class NpzWriter:
             metadata |= meta  # Merge additional metadata if provided
 
         metadata_path.write_text(yaml.safe_dump(serialize(metadata), sort_keys=False))
+
+
+@dataclass
+class StreamingWriter:
+    """
+    Append-only writer for open-ended time-series data where the total number
+    of samples is not known in advance.
+
+    Arrays start at size 0 and grow along the time axis with each call to
+    append(). Samples are buffered in memory and flushed to disk in batches
+    of chunk_size to minimise the number of resize operations.
+
+    A '_time' array is always written alongside the data, storing Unix
+    timestamps (float64) for each sample.
+
+    Args:
+        root:        directory for vault.zarr and metadata.yaml
+        readouts:    dict mapping readout name to its trailing shape.
+                     Use an empty tuple () for scalars, (N,) for traces,
+                     (H, W) for images.
+                     Example: {"lockin_X": (), "S21": (1601,), "frame": (480, 640)}
+        chunk_size:  number of samples per chunk along the time axis.
+                     Also the buffer size — flush() is called automatically
+                     once this many samples have been buffered.
+        dtype:       numpy dtype for all data arrays (default "float32").
+        tags:        free-form tags written to metadata on close().
+        overwrite:   if True, an existing vault at root will be overwritten.
+    """
+
+    root: str | Path
+    readouts: dict[str, tuple]
+    chunk_size: int = 256
+    dtype: str = "float32"
+    tags: list[str] = field(default_factory=list)
+    overwrite: bool = False
+
+    _count: int = field(init=False, default=0)
+    _buf_time: list = field(init=False, default_factory=list)
+    _buf_data: dict = field(init=False, default_factory=dict)
+
+    def __post_init__(self):
+        self.root = Path(self.root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.vault = zarr.group(str(self.root / "vault.zarr"))
+        self._buf_data = {name: [] for name in self.readouts}
+
+        # Timestamp coordinate array — always present
+        self.vault.create_array(
+            name="_time",
+            shape=(0,),
+            chunks=(self.chunk_size,),
+            dtype="float64",
+            overwrite=self.overwrite,
+        )
+
+        for name, trailing in self.readouts.items():
+            self.vault.create_array(
+                name=name,
+                shape=(0,) + trailing,
+                chunks=(self.chunk_size,) + trailing,
+                dtype=self.dtype,
+                overwrite=self.overwrite,
+            )
+
+    def append(self, data: dict, timestamp: float = None):
+        """Buffer one sample. Flushes to disk automatically when chunk_size is reached.
+
+        Args:
+            data:      dict mapping readout name to value (scalar, 1-D, or 2-D array).
+            timestamp: Unix timestamp for this sample. Defaults to datetime.now().
+        """
+        if timestamp is None:
+            timestamp = datetime.now().timestamp()
+        self._buf_time.append(timestamp)
+        for name, value in data.items():
+            self._buf_data[name].append(np.asarray(value, dtype=self.dtype))
+        if len(self._buf_time) >= self.chunk_size:
+            self.flush()
+
+    def flush(self):
+        """Write all buffered samples to disk in a single resize + write operation."""
+        n_new = len(self._buf_time)
+        if n_new == 0:
+            return
+        n_old = self._count
+        n_total = n_old + n_new
+
+        self.vault["_time"].resize((n_total,))
+        self.vault["_time"][n_old:n_total] = np.array(self._buf_time)
+
+        for name, samples in self._buf_data.items():
+            if not samples:
+                continue
+            arr = self.vault[name]
+            arr.resize((n_total,) + arr.shape[1:])
+            arr[n_old:n_total] = np.stack(samples)
+
+        self._count = n_total
+        self._buf_time = []
+        self._buf_data = {name: [] for name in self.readouts}
+
+    def close(self, meta: dict = None):
+        """Flush remaining buffered samples and write metadata.
+
+        Writes Zarr group attributes (JSON) and a metadata.yaml file,
+        consistent with the convention used by ZarrWriter.
+
+        Args:
+            meta: additional key-value pairs to include in the metadata.
+        """
+        self.flush()
+        metadata = {
+            "date":     datetime.now().isoformat(),
+            "count":    self._count,
+            "tags":     self.tags,
+            "readouts": {k: list(v) for k, v in self.readouts.items()},
+        }
+        if meta:
+            metadata |= meta
+        metadata = serialize(metadata)
+        self.vault.attrs.put(metadata)
+        (self.root / "metadata.yaml").write_text(yaml.safe_dump(metadata, sort_keys=False))
