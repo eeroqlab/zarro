@@ -63,9 +63,15 @@ class AxisSpecs:
     Args:
         controls: list of ControlVar instances that define the control variables for this axis.
             All ControlVar instances in the list must have the same length (number of points) to ensure consistent indexing along this axis.
+        name: optional explicit name for this axis, used as the array dimension name.
+            If omitted, an axis with a single control is named after that control; an axis
+            with several co-varying controls (an elaborate trajectory through parameter
+            space) is named "trajectory".
     """
     controls: list[ControlVar]
+    name: Optional[str] = None
     length: int = field(init=False)
+    dim_name: str = field(init=False)  # resolved dimension name for this axis
 
     def __post_init__(self):
         # FIX: replaced assert with ValueError so validation isn't stripped by python -O
@@ -75,6 +81,15 @@ class AxisSpecs:
         if len(set(length_list)) > 1:
             raise ValueError(f"All ControlVar instances must have the same length, got: {length_list}")
         self.length = length_list[0] if length_list else 0
+
+        # Resolve the dimension name once: explicit name wins; a lone control names the
+        # axis after itself; several co-varying controls form a trajectory.
+        if self.name is not None:
+            self.dim_name = self.name
+        elif len(self.controls) == 1:
+            self.dim_name = self.controls[0].name
+        else:
+            self.dim_name = "trajectory"
 
     @property
     def names(self) -> list[str]:
@@ -88,6 +103,32 @@ class ReadoutSpecs:
     unit: Optional[str | list[str]] = None
     shape: Optional[tuple[int, ...]] = None  # For trace/array data, specify the shape of the trailing dimensions (e.g. trace length or image height/width)
     contains: Optional[str | list[str]] = None
+    dims: Optional[tuple[str, ...]] = None  # Optional names for the trailing (non-control) dimensions. If None, sensible names are generated from the readout name/kind.
+    trailing_dims: list[str] = field(init=False)  # resolved names for the trailing (readout-local) dimensions
+
+    def __post_init__(self):
+        # Resolve the trailing (non-control) dimension names once, so the created
+        # Zarr arrays are self-describing (and readable by xarray). An explicit
+        # `dims` wins; otherwise names are derived from the readout name and kind.
+        if self.dims is not None:
+            if self.shape is not None and len(self.dims) != len(self.shape):
+                raise ValueError(
+                    f"Readout '{self.name}': dims has {len(self.dims)} names but shape has "
+                    f"{len(self.shape)} trailing dimensions"
+                )
+            self.trailing_dims = list(self.dims)
+            return
+
+        match self.kind:
+            case DataKind.SCALAR:
+                self.trailing_dims = []
+            case DataKind.TRACE:
+                self.trailing_dims = [f"{self.name}_i"]
+            case DataKind.IMAGE:
+                self.trailing_dims = [f"{self.name}_row", f"{self.name}_col"]
+            case _:
+                # Fall back to generic names matching the declared trailing shape.
+                self.trailing_dims = [f"{self.name}_dim{k}" for k in range(len(self.shape or ()))]
 
 
 @dataclass(slots=True)
@@ -106,6 +147,8 @@ class MeasurementSchema:
     readout: list[ReadoutSpecs]
     writetype: WriteType = WriteType.POINTWISE
     meta: dict = field(init=False)
+    control_dims: list[str] = field(init=False)       # one dimension name per control axis
+    dim_names: dict[str, list[str]] = field(init=False)  # full dimension names per readout array
 
     @property
     def axis_names(self) -> dict:  # FIX: was annotated as list[str] but returns a dict
@@ -128,6 +171,22 @@ class MeasurementSchema:
         self.meta = {
             "control": self.axis_names,
             "readout": readout_meta
+        }
+
+        # Resolve dimension names once (the schema is fixed for a measurement).
+        # Each control axis contributes one dimension; de-duplicate so names stay
+        # unique even when several axes resolve to the same label (e.g. two
+        # unnamed "trajectory" axes).
+        raw = [axis.dim_name for axis in self.control]
+        self.control_dims = [
+            f"{nm}{i}" if raw.count(nm) > 1 else nm
+            for i, nm in enumerate(raw)
+        ]
+
+        # Full dimension names per readout array = control axes + readout-local dims.
+        self.dim_names = {
+            r.name: self.control_dims + r.trailing_dims
+            for r in self.readout
         }
 
 
@@ -255,13 +314,18 @@ class ZarrWriter:
 
     def _init_coord_arrays(self):
         """Initialize coordinate arrays for control variables."""
-        for ax in self.schema.control:
+        # FIX: populate Zarr `dimension_names`. A coordinate lies along its axis's
+        # dimension: for a single-control axis that is the control's own name; for a
+        # trajectory axis the co-varying controls share the axis dimension, so they
+        # attach as xarray coordinates on it.
+        for ax, dim in zip(self.schema.control, self.schema.control_dims):
             for var in ax.controls:
                 arr = self.vault.create_array(
                     name=var.name,
                     shape=var.values.shape,
                     dtype=self.dtype,  # FIX: use self.dtype instead of hardcoded "float32"
                     overwrite=self.overwrite,
+                    dimension_names=[dim],
                 )
                 arr[:] = np.asarray(var.values)
 
@@ -270,6 +334,10 @@ class ZarrWriter:
         """Initialize data arrays for measurement readouts."""
 
         for readout in self.schema.readout:
+
+            # FIX: populate Zarr `dimension_names` (control axes + readout-local dims),
+            # resolved once on the schema.
+            dimension_names = self.schema.dim_names[readout.name]
 
             match readout.kind:
                 case DataKind.SCALAR:
@@ -304,6 +372,7 @@ class ZarrWriter:
                 chunks=chunk_shape,
                 dtype=self.dtype,  # FIX: use self.dtype instead of hardcoded "float32"
                 overwrite=self.overwrite,
+                dimension_names=dimension_names,  # FIX: control axis names + readout-local names
             )
 
 
@@ -495,19 +564,29 @@ class ZarrWriter:
         self.write_yaml(meta)  # Also write a human-readable YAML manifest
 
 
-    def add_array(self, name: str, value: np.ndarray | list, meta: dict[str] = None):
-        """Add a new array to the vault after initialization. Useful for adding derived datasets."""
+    def add_array(self, name: str, value: np.ndarray | list, meta: dict[str] = None,
+                  dims: Optional[list[str]] = None):
+        """Add a new array to the vault after initialization. Useful for adding derived datasets.
+
+        Args:
+            dims: optional dimension names for this array. For a 1-D coordinate, pass
+                ``[name]`` so it is named after itself (consistent with control coords).
+        """
         if name in self.vault and not self.overwrite:
             raise KeyError(f"Dataset '{name}' already exists")
 
         value = np.asarray(value)
+
+        if dims is not None and len(dims) != value.ndim:
+            raise ValueError(f"dims has {len(dims)} names but array '{name}' has {value.ndim} dimensions")
 
         arr = self.vault.create_array(
             name=name,
             shape=value.shape,
             dtype=value.dtype,
             overwrite=self.overwrite,
-            attributes=meta
+            attributes=meta,
+            dimension_names=dims,
         )
         arr[:] = value
 
@@ -614,15 +693,19 @@ class StreamingWriter:
             chunks=(self.chunk_size,),
             dtype="float64",
             overwrite=self.overwrite,
+            dimension_names=["_time"],  # FIX: 1-D coordinate named after itself
         )
 
         for name, trailing in self.readouts.items():
+            # Leading sample axis shares the "_time" dimension; trailing dims named per readout.
+            dimension_names = ["_time"] + [f"{name}_dim{k}" for k in range(len(trailing))]
             self.vault.create_array(
                 name=name,
                 shape=(0,) + trailing,
                 chunks=(self.chunk_size,) + trailing,
                 dtype=self.dtype,
                 overwrite=self.overwrite,
+                dimension_names=dimension_names,  # FIX: self-describing dimensions
             )
 
     def append(self, data: dict, timestamp: float = None):
