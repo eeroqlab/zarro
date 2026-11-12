@@ -72,6 +72,20 @@ def _infer_kind(trailing: tuple[int, ...]) -> str:
     return ("scalar", "trace", "image")[min(len(trailing), 2)]
 
 
+def _print_table(rows, headers, title, tabulate) -> None:
+    print(title)
+    if tabulate is not None:
+        print(tabulate(rows, headers=headers, tablefmt="simple"))
+    else:
+        # minimal fallback when tabulate is not installed
+        col_widths = [max(len(str(h)), *(len(str(r[i])) for r in rows)) for i, h in enumerate(headers)]
+        fmt = "  ".join(f"{{:<{w}}}" for w in col_widths)
+        print(fmt.format(*headers))
+        print("  ".join("-" * w for w in col_widths))
+        for row in rows:
+            print(fmt.format(*row))
+
+
 class Vault:
     """A run directory opened for reading.
 
@@ -269,6 +283,56 @@ class Vault:
 
         walk(str(root), ())
         return found
+
+    def snapshot(self) -> None:
+        """Print a human-readable summary of the vault."""
+        try:
+            from tabulate import tabulate
+        except ImportError:
+            tabulate = None
+
+        shape_str = "x".join(map(str, self.shape))
+        date = self.metadata.get("date", "—")
+        tags_str = ", ".join(self.tags) if self.tags else "—"
+
+        print(f"Kind:  {self.kind:<10}  Shape: {shape_str:<12}  Date: {date}")
+        print(f"Tags:  {tags_str}")
+        print(f"Path:  {self.path}")
+
+        if self.kind == "sweep":
+            print()
+            axis_rows = []
+            for ax in self.axes:
+                for name in ax.controls:
+                    unit = (ax.units or {}).get(name) or "—"
+                    axis_rows.append([f"axis{ax.index}", name, ax.length, unit])
+            _print_table(
+                axis_rows,
+                headers=["axis", "variable", "length", "unit"],
+                title="Control axes",
+                tabulate=tabulate,
+            )
+        else:
+            n = self.shape[0]
+            print(f"\nTime axis:  {n} sample{'s' if n != 1 else ''}")
+
+        print()
+        readout_rows = [
+            [
+                name,
+                r.kind,
+                str(r.shape) if r.shape else "()",
+                r.unit if r.unit is not None else "—",
+                r.contains if r.contains is not None else "—",
+            ]
+            for name, r in self.readouts.items()
+        ]
+        _print_table(
+            readout_rows,
+            headers=["name", "kind", "shape", "unit", "contains"],
+            title="Readouts",
+            tabulate=tabulate,
+        )
 
     def __repr__(self) -> str:
         shape = "x".join(map(str, self.shape))

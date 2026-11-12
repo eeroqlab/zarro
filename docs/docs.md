@@ -32,6 +32,13 @@ A comprehensive guide to the `zarro` package for structured experimental data sa
    - [Tags](#63-tags)
 7. [Adding Arrays After Initialization](#7-adding-arrays-after-initialization)
 8. [Reading Data](#8-reading-data)
+   - [Quick overview with snapshot](#81-quick-overview-with-snapshot)
+   - [Control axes and coordinates](#82-control-axes-and-coordinates)
+   - [Readout metadata](#83-readout-metadata)
+   - [Reading data arrays](#84-reading-data-arrays)
+   - [Tracking progress mid-run](#85-tracking-progress-mid-run)
+   - [Monitor runs](#86-monitor-runs-streamingwriter)
+   - [Fallback when metadata is missing](#87-fallback-when-metadata-is-missing)
 9. [Experiment ID Management](#9-experiment-id-management)
 10. [NpzWriter](#10-npzwriter)
 11. [Schemaless Writing](#11-schemaless-writing)
@@ -506,7 +513,44 @@ print(run.tags)          # ["vna", "2K"]
 print(run.metadata)      # full merged dict (zarr attrs + metadata.yaml)
 ```
 
-### 8.1 Control axes and coordinates
+### 8.1 Quick overview with `snapshot`
+
+Call `snapshot()` for a formatted summary of the vault — useful at the Python
+REPL or in a notebook after opening a run:
+
+```python
+run.snapshot()
+```
+
+Example output for a 2D sweep:
+
+```
+Kind:  sweep       Shape: 20x1601       Date: 2026-11-12T14:03:21
+Tags:  vna, 2K
+Path:  ./data/run_001
+
+Control axes
+axis    variable      length  unit
+------  ----------  --------  ------
+axis0   power             20  dBm
+axis1   freq            1601  Hz
+
+Readouts
+name      kind    shape     unit    contains
+--------  ------  --------  ------  ----------
+S21_mag   scalar  ()        dBm     —
+S21       trace   (1601,)   V       S21
+```
+
+For a **monitor** run the control-axes block is replaced by `Time axis: N samples`.
+
+For a **multi-control axis** (two variables sharing one axis), each variable
+appears on its own row under the same `axis0` label.
+
+`snapshot` requires [tabulate](https://pypi.org/project/tabulate/) and falls
+back to a plain-text table when it is not installed.
+
+### 8.2 Control axes and coordinates
 
 ```python
 # Axes, outermost first
@@ -523,7 +567,7 @@ run.coord_axis["freq"]    # 1
 run.coord_axis["power"]   # 0
 ```
 
-### 8.2 Readout metadata
+### 8.3 Readout metadata
 
 ```python
 for name, r in run.readouts.items():
@@ -533,7 +577,7 @@ for name, r in run.readouts.items():
     # frame    image   (64,64)  None  None
 ```
 
-### 8.3 Reading data arrays
+### 8.4 Reading data arrays
 
 ```python
 # Raw array — 0.0 where nothing has been written yet
@@ -545,7 +589,7 @@ point   = run.read("S21_mag", (3, 100)) # scalar
 signal = run.values("S21_mag")          # shape (20, 1601), NaN at unwritten points
 ```
 
-### 8.4 Tracking progress mid-run
+### 8.5 Tracking progress mid-run
 
 `written_mask` returns a boolean grid that is True where data has been written.
 It works on running sweeps without blocking the writer.
@@ -568,7 +612,7 @@ mask = run.written_mask("S21_mag", order=my_order_array)
   position is also counted as written (order-prefix rule), so a genuine 0.0
   inside the scanned region remains visible.
 
-### 8.5 Monitor runs (StreamingWriter)
+### 8.6 Monitor runs (StreamingWriter)
 
 ```python
 run = open_vault("./data/mon_001")
@@ -582,7 +626,7 @@ x_values = run.values("x")   # shape (n_samples,), always fully written
 The vault can be opened before the writer calls `close()`.
 The readout shapes are inferred automatically from the array dimensions.
 
-### 8.6 Fallback when metadata is missing
+### 8.7 Fallback when metadata is missing
 
 If `metadata.yaml` is gone and zarr attributes were never written, pass the
 structure explicitly:
@@ -595,7 +639,7 @@ run = Vault(
 )
 ```
 
-### 8.7 Low-level zarr access
+### 8.8 Low-level zarr access
 
 The underlying zarr group is always accessible for direct numpy-style reads:
 
@@ -1103,6 +1147,7 @@ Methods:
 vault.read(name, selection=Ellipsis) → np.ndarray  # 0.0 at unwritten points
 vault.values(name) → np.ndarray                    # NaN at unwritten points
 vault.written_mask(name, order=None) → np.ndarray  # bool grid
+vault.snapshot()                                    # print formatted summary
 ```
 
 #### `Axis`

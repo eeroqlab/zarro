@@ -13,7 +13,10 @@ CHANGES
 - core: control variable units stored in new dict format {"Vch": {"unit": "V"}}
   (reader handles both old list format and new dict format)
 - tests: added tests/test_reader.py with comprehensive reader coverage
-- docs: rewrote section 8 "Reading Data" and added reader API to section 14
+- docs: rewrote section 8 "Reading Data" (8 subsections) and added reader API to section 14
+- reader: added Vault.snapshot() — tabulate-formatted summary (kind, shape, date, tags,
+  control axes with units, readouts with kind/shape/unit/contains); plain-text fallback
+  when tabulate is not installed
 
 [2026-11-11]
 - tests: renamed TestWriteNpzlike → TestDump; replaced write_npzlike() calls
