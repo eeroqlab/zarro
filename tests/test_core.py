@@ -14,7 +14,7 @@ import pytest
 import yaml
 import zarr
 
-from zarro.core2 import (
+from zarro.core import (
     AxisSpecs,
     ControlVar,
     DataKind,
