@@ -32,6 +32,13 @@ A comprehensive guide to the `zarro` package for structured experimental data sa
    - [Tags](#63-tags)
 7. [Adding Arrays After Initialization](#7-adding-arrays-after-initialization)
 8. [Reading Data](#8-reading-data)
+   - [Quick overview with snapshot](#81-quick-overview-with-snapshot)
+   - [Control axes and coordinates](#82-control-axes-and-coordinates)
+   - [Readout metadata](#83-readout-metadata)
+   - [Reading data arrays](#84-reading-data-arrays)
+   - [Tracking progress mid-run](#85-tracking-progress-mid-run)
+   - [Monitor runs](#86-monitor-runs-streamingwriter)
+   - [Fallback when metadata is missing](#87-fallback-when-metadata-is-missing)
 9. [Experiment ID Management](#9-experiment-id-management)
 10. [NpzWriter](#10-npzwriter)
 11. [Schemaless Writing](#11-schemaless-writing)
@@ -45,6 +52,7 @@ A comprehensive guide to the `zarro` package for structured experimental data sa
     - [Manual timestamps](#127-manual-timestamps)
 13. [Sharding and Performance](#13-sharding-and-performance)
 14. [API Reference](#14-api-reference)
+15. [Version Management](#15-version-management)
 
 ---
 
@@ -490,44 +498,156 @@ For a fully NPZ-like workflow (no schema, no streaming), see [Section 11](#11-sc
 
 ## 8. Reading Data
 
-The vault is a standard Zarr v3 group readable by any Zarr-compatible tool:
+Use `open_vault` (or `Vault` directly) to open a run directory for analysis.
+The reader works on finished runs, interrupted runs, and runs still in progress.
+
+```python
+from zarro import open_vault
+
+run = open_vault("./data/run_001")
+
+# Kind: "sweep" for ZarrWriter runs, "monitor" for StreamingWriter runs
+print(run.kind)          # "sweep"
+print(run.shape)         # (20, 1601)
+print(run.tags)          # ["vna", "2K"]
+print(run.metadata)      # full merged dict (zarr attrs + metadata.yaml)
+```
+
+### 8.1 Quick overview with `snapshot`
+
+Call `snapshot()` for a formatted summary of the vault — useful at the Python
+REPL or in a notebook after opening a run:
+
+```python
+run.snapshot()
+```
+
+Example output for a 2D sweep:
+
+```
+Kind:  sweep       Shape: 20x1601       Date: 2026-11-12T14:03:21
+Tags:  vna, 2K
+Path:  ./data/run_001
+
+Control axes
+axis    variable      length  unit
+------  ----------  --------  ------
+axis0   power             20  dBm
+axis1   freq            1601  Hz
+
+Readouts
+name      kind    shape     unit    contains
+--------  ------  --------  ------  ----------
+S21_mag   scalar  ()        dBm     —
+S21       trace   (1601,)   V       S21
+```
+
+For a **monitor** run the control-axes block is replaced by `Time axis: N samples`.
+
+For a **multi-control axis** (two variables sharing one axis), each variable
+appears on its own row under the same `axis0` label.
+
+`snapshot` requires [tabulate](https://pypi.org/project/tabulate/) and falls
+back to a plain-text table when it is not installed.
+
+### 8.2 Control axes and coordinates
+
+```python
+# Axes, outermost first
+for ax in run.axes:
+    print(ax.index, ax.controls, ax.length, ax.units)
+    # e.g. 0  ('power',)  20  {'power': 'dBm'}
+
+# Coordinate values as numpy arrays
+freqs  = run.coords["freq"]    # shape (1601,)
+powers = run.coords["power"]   # shape (20,)
+
+# Which axis does a coordinate belong to?
+run.coord_axis["freq"]    # 1
+run.coord_axis["power"]   # 0
+```
+
+### 8.3 Readout metadata
+
+```python
+for name, r in run.readouts.items():
+    print(name, r.kind, r.shape, r.unit, r.contains)
+    # S21_mag  scalar  ()       dBm   None
+    # S21      trace   (1601,)  V     S21
+    # frame    image   (64,64)  None  None
+```
+
+### 8.4 Reading data arrays
+
+```python
+# Raw array — 0.0 where nothing has been written yet
+all_mag = run.read("S21_mag")           # shape (20, 1601)
+row_5   = run.read("S21_mag", (5,))     # shape (1601,)
+point   = run.read("S21_mag", (3, 100)) # scalar
+
+# NaN-masked array — NaN where unwritten (use this for mid-run reads)
+signal = run.values("S21_mag")          # shape (20, 1601), NaN at unwritten points
+```
+
+### 8.5 Tracking progress mid-run
+
+`written_mask` returns a boolean grid that is True where data has been written.
+It works on running sweeps without blocking the writer.
+
+```python
+mask = run.written_mask("S21_mag")       # shape == run.shape
+print(f"{mask.sum()} / {mask.size} points done")
+
+# Custom visiting order (e.g. snake sweep: row 0 L→R, row 1 R→L, ...)
+mask = run.written_mask("S21_mag", order=my_order_array)
+```
+
+**How it works:**
+
+- **Scalar** readouts are stored in plain chunks: a point is written when its
+  chunk file exists on disk.
+- **Trace/image** readouts are stored in shards: a point is written when any
+  of its values is non-zero (since zarr fills unwritten positions with 0.0).
+- In both cases, every position visited *before* the last confirmed written
+  position is also counted as written (order-prefix rule), so a genuine 0.0
+  inside the scanned region remains visible.
+
+### 8.6 Monitor runs (StreamingWriter)
+
+```python
+run = open_vault("./data/mon_001")
+print(run.kind)    # "monitor"
+print(run.shape)   # (n_samples,) — grows while the run is live
+print(run.time)    # unix timestamps, shape (n_samples,)
+
+x_values = run.values("x")   # shape (n_samples,), always fully written
+```
+
+The vault can be opened before the writer calls `close()`.
+The readout shapes are inferred automatically from the array dimensions.
+
+### 8.7 Fallback when metadata is missing
+
+If `metadata.yaml` is gone and zarr attributes were never written, pass the
+structure explicitly:
+
+```python
+run = Vault(
+    "./data/run_001",
+    control={"axis0": {"freq": {"unit": "Hz"}}, "axis1": {"power": {"unit": "dBm"}}},
+    readouts={"S21_mag": {"kind": "scalar", "unit": "dBm"}},
+)
+```
+
+### 8.8 Low-level zarr access
+
+The underlying zarr group is always accessible for direct numpy-style reads:
 
 ```python
 import zarr
-import numpy as np
-
 z = zarr.open("./data/run_001/vault.zarr", mode="r")
-
-# List all arrays
 print(list(z.keys()))
-# ['freq', 'power', 'S21_mag', 'S21_phase', 'S21_trace']
-
-# Read metadata
-attrs = dict(z.attrs)
-print(attrs["date"])
-print(attrs["tags"])
-print(attrs["schema"])
-
-# Read coordinate arrays
-freqs  = z["freq"][:]   # shape (1601,)
-powers = z["power"][:]  # shape (20,)
-
-# Read data arrays (numpy-style indexing)
-all_mag   = z["S21_mag"][:]        # shape (20, 1601)
-row_5     = z["S21_mag"][5, :]     # one power slice, all freqs
-point     = z["S21_mag"][3, 100]   # single point
-
-# Trace data
-traces    = z["S21_trace"][:]      # shape (20, 1601, 1601) for a trace readout
-```
-
-Read `metadata.yaml` directly for a human-readable summary:
-
-```python
-import yaml
-with open("./data/run_001/metadata.yaml") as f:
-    meta = yaml.safe_load(f)
-print(meta)
+all_mag = z["S21_mag"][:]     # shape (20, 1601)
 ```
 
 ---
@@ -991,3 +1111,121 @@ encode_value(x)    # numpy array/scalar → JSON-serializable Python type
 serialize(x)       # full JSON encode/decode cycle using encode_value
 compute_sharding(shape: tuple, num_shards: int) → tuple   # compute shard shape
 ```
+
+---
+
+### Reader
+
+```python
+from zarro import open_vault, Vault, VaultError
+from zarro.reader import Axis, Readout
+```
+
+#### `open_vault(path)`
+
+Convenience wrapper — returns `Vault(path)`.
+
+#### `Vault(path, *, control=None, readouts=None)`
+
+Open a run directory for reading.
+
+| Attribute | Type | Description |
+|---|---|---|
+| `kind` | `"sweep"` or `"monitor"` | Determined by presence of `_time` array |
+| `shape` | `tuple[int, ...]` | Grid shape, or `(n_samples,)` for monitors |
+| `metadata` | `dict` | zarr attrs merged with `metadata.yaml` |
+| `tags` | `list[str]` | |
+| `axes` | `list[Axis]` | Outermost axis first; empty for monitors |
+| `coords` | `dict[str, np.ndarray]` | Coordinate values per control variable |
+| `coord_axis` | `dict[str, int]` | Axis index for each control variable |
+| `readouts` | `dict[str, Readout]` | One entry per data array |
+| `time` | `np.ndarray` | Unix timestamps (monitors only) |
+
+Methods:
+
+```python
+vault.read(name, selection=Ellipsis) → np.ndarray  # 0.0 at unwritten points
+vault.values(name) → np.ndarray                    # NaN at unwritten points
+vault.written_mask(name, order=None) → np.ndarray  # bool grid
+vault.snapshot()                                    # print formatted summary
+```
+
+#### `Axis`
+
+```python
+@dataclass(frozen=True)
+class Axis:
+    index: int
+    controls: tuple[str, ...]
+    length: int
+    units: dict[str, str | None]   # {name: unit_string_or_None}
+```
+
+#### `Readout`
+
+```python
+@dataclass(frozen=True)
+class Readout:
+    name: str
+    kind: str                           # "scalar" | "trace" | "image"
+    shape: tuple[int, ...]              # trailing shape; () for scalar
+    unit: str | list[str] | None
+    contains: str | list[str] | None
+```
+
+#### `VaultError`
+
+Raised when the directory is not a readable zarro run, a required array is
+missing, or metadata cannot be parsed without fallback arguments.
+
+---
+
+## 15. Version Management
+
+Versioning is handled automatically by [setuptools-scm](https://setuptools-scm.readthedocs.io/). The version is derived from git tags — there is no version string to maintain manually in the source code.
+
+### Checking the current version
+
+```python
+import zarro
+print(zarro.__version__)
+```
+
+### Version string format
+
+| Situation | Example |
+|---|---|
+| Exactly on a tag | `0.2.0` |
+| Commits ahead of a tag | `0.2.1.dev4+gabcd1234` |
+| Uncommitted changes present | `0.2.1.dev4+gabcd1234.d20261112` |
+
+### Releasing a new version
+
+```bash
+# 1. Finish and commit all changes
+git add -A && git commit -m "release v0.3.0"
+
+# 2. Create the tag
+git tag v0.3.0
+
+# 3. Push branch and tag
+git push --follow-tags
+
+# 4. Reinstall locally so _version.py is regenerated
+pip install -e .
+
+# 5. Verify
+python -c "import zarro; print(zarro.__version__)"  # → 0.3.0
+```
+
+> **Note:** step 4 (reinstall) is only needed locally after tagging. Regular code edits are picked up immediately by the editable install without any reinstall.
+
+### Why --follow-tags?
+
+`git push` alone sends branch commits but never tags. `--follow-tags` pushes the branch and any tags reachable from it in one command. You can make this the default permanently:
+
+```bash
+git config --global push.followTags true
+```
+
+After that, plain `git push` does everything.
