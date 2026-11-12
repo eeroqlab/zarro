@@ -382,27 +382,27 @@ class TestZarrWriter1D:
 # ZarrWriter — write_npzlike (tutorial "Writing npz_like")
 # ===========================================================================
 
-class TestWriteNpzlike:
+class TestDump:
 
-    def test_write_npzlike_arrays_in_vault(self, tmp_path):
-        """Tutorial: writer.write_npzlike(data) without initialize_arrays."""
+    def test_dump_arrays_in_vault(self, tmp_path):
+        """Schemaless write via dump() without initialize_arrays."""
         writer = ZarrWriter(root=tmp_path, overwrite=True)
         data = {
             "S21":         np.random.rand(N_OUTER, N_INNER, N_TRACE),
             "temperature": np.random.rand(N_OUTER, N_INNER),
         }
-        writer.write_npzlike(data)
+        writer.dump(data)
 
         z = zarr.open(str(tmp_path / "vault.zarr"), mode="r")
         assert "S21" in z
         assert "temperature" in z
         np.testing.assert_array_almost_equal(z["S21"][:], data["S21"])
 
-    def test_write_npzlike_image(self, tmp_path):
-        """Tutorial: writer2.write_npzlike({'S34': np.asarray([freq, mag, phase])})."""
+    def test_dump_image(self, tmp_path):
+        """Schemaless write of a 2-D array via dump()."""
         writer = ZarrWriter(root=tmp_path, overwrite=True)
         S34 = np.random.rand(3, N_TRACE)
-        writer.write_npzlike({"S34": S34})
+        writer.dump({"S34": S34})
 
         z = zarr.open(str(tmp_path / "vault.zarr"), mode="r")
         assert "S34" in z
@@ -413,6 +413,7 @@ class TestWriteNpzlike:
         writer.add_array("Freqs", np.zeros(10))
         with pytest.raises(KeyError, match="already exists"):
             writer.add_array("Freqs", np.zeros(10))
+
 
 
 # ===========================================================================

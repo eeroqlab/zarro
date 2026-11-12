@@ -1,0 +1,25 @@
+CHANGES
+=======
+
+[2026-11-11]
+- tests: renamed TestWriteNpzlike → TestDump; replaced write_npzlike() calls
+  with dump() to match the actual ZarrWriter API
+
+[2026-11-11] cedc6e7
+- Added StreamingWriter class (append-only open-ended time-series writer)
+- Updated README
+- Added comprehensive tutorials/TUTORIAL.md
+
+[2026-11-11] b493985
+- ControlVar: added reverse field for hysteresis sweeps (doubles the values
+  array by appending its reversed copy)
+
+[2026-11-11] c87cf3f
+- ControlVar: added length property
+
+[2026-11-11] c65fda3
+- Bug fixes
+
+[2026-11-11] b145f5f
+- Added ExperimentID class for auto-incrementing numbered experiment directories
+- Minor bug fixes

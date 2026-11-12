@@ -26,3 +26,4 @@ _autosummary/
 
 # exceptions
 !requirements.txt
+!CHANGES.txt
