@@ -45,6 +45,7 @@ A comprehensive guide to the `zarro` package for structured experimental data sa
     - [Manual timestamps](#127-manual-timestamps)
 13. [Sharding and Performance](#13-sharding-and-performance)
 14. [API Reference](#14-api-reference)
+15. [Version Management](#15-version-management)
 
 ---
 
@@ -991,3 +992,55 @@ encode_value(x)    # numpy array/scalar → JSON-serializable Python type
 serialize(x)       # full JSON encode/decode cycle using encode_value
 compute_sharding(shape: tuple, num_shards: int) → tuple   # compute shard shape
 ```
+
+---
+
+## 15. Version Management
+
+Versioning is handled automatically by [setuptools-scm](https://setuptools-scm.readthedocs.io/). The version is derived from git tags — there is no version string to maintain manually in the source code.
+
+### Checking the current version
+
+```python
+import zarro
+print(zarro.__version__)
+```
+
+### Version string format
+
+| Situation | Example |
+|---|---|
+| Exactly on a tag | `0.2.0` |
+| Commits ahead of a tag | `0.2.1.dev4+gabcd1234` |
+| Uncommitted changes present | `0.2.1.dev4+gabcd1234.d20261112` |
+
+### Releasing a new version
+
+```bash
+# 1. Finish and commit all changes
+git add -A && git commit -m "release v0.3.0"
+
+# 2. Create the tag
+git tag v0.3.0
+
+# 3. Push branch and tag
+git push --follow-tags
+
+# 4. Reinstall locally so _version.py is regenerated
+pip install -e .
+
+# 5. Verify
+python -c "import zarro; print(zarro.__version__)"  # → 0.3.0
+```
+
+> **Note:** step 4 (reinstall) is only needed locally after tagging. Regular code edits are picked up immediately by the editable install without any reinstall.
+
+### Why --follow-tags?
+
+`git push` alone sends branch commits but never tags. `--follow-tags` pushes the branch and any tags reachable from it in one command. You can make this the default permanently:
+
+```bash
+git config --global push.followTags true
+```
+
+After that, plain `git push` does everything.

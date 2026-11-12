@@ -1,7 +1,7 @@
 """
-Tests for zarro/core2.py.
+Tests for zarro/core.py.
 Covers all write patterns shown in tutorials/demo.ipynb plus error cases and
-the fixes applied in core2 (error messages, shape validation, date field, etc.).
+the fixes applied in core (error messages, shape validation, date field, etc.).
 
 Run with:  pytest tests/
 """
