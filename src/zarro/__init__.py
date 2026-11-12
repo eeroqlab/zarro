@@ -1,3 +1,4 @@
+from ._version import __version__
 from .core import (
     DataKind,
     WriteType,
@@ -11,6 +12,7 @@ from .core import (
 )
 
 __all__ = [
+    "__version__",
     "DataKind",
     "WriteType",
     "ControlVar",
