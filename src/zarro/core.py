@@ -324,7 +324,7 @@ class ZarrWriter:
                 # FIX: replaced assert with ValueError so validation isn't stripped by python -O
                 if len(shape) <= 1:
                     raise ValueError("Control shape must have at least two dimensions for imagewise writes")
-                return (1,) * (len(shape) - 2) + (shape[-1], shape[-2])
+                return (1,) * (len(shape) - 2) + (shape[-2], shape[-1])
 
             case WriteType.ALL:
                 return shape

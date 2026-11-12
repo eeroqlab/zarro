@@ -379,6 +379,127 @@ class TestZarrWriter1D:
 
 
 # ===========================================================================
+# ZarrWriter — IMAGEWISE (bug fix: chunk shape was transposed for non-square grids)
+# ===========================================================================
+
+def make_imagewise_schema(grid: tuple[int, int], readout: ReadoutSpecs) -> MeasurementSchema:
+    a = ControlVar("a", np.arange(grid[0], dtype=np.float32))
+    b = ControlVar("b", np.arange(grid[1], dtype=np.float32))
+    return MeasurementSchema(
+        control=[AxisSpecs([a]), AxisSpecs([b])],
+        readout=[readout],
+        writetype=WriteType.IMAGEWISE,
+    )
+
+
+class TestZarrWriterImagewise:
+
+    # --- array creation succeeds for all readout kinds and grid shapes ---
+
+    @pytest.mark.parametrize("grid", [(4, 4), (3, 4), (4, 3)])
+    @pytest.mark.parametrize("ro", [
+        ReadoutSpecs("r", DataKind.SCALAR),
+        ReadoutSpecs("r", DataKind.TRACE,  shape=(8,)),
+        ReadoutSpecs("r", DataKind.IMAGE,  shape=(3, 5)),
+    ])
+    def test_array_creation_2d_grid(self, tmp_path, grid, ro):
+        schema = make_imagewise_schema(grid, ro)
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        z = zarr.open(str(tmp_path / "vault.zarr"), mode="r")
+        assert "r" in z
+
+    # --- chunk shape is (1,)*(n-2) + (rows, cols) [+ trailing] ---
+
+    @pytest.mark.parametrize("grid,expected_chunk_base", [
+        ((4, 4), (4, 4)),
+        ((3, 4), (3, 4)),
+        ((4, 3), (4, 3)),
+    ])
+    def test_chunk_shape_scalar_2d(self, tmp_path, grid, expected_chunk_base):
+        schema = make_imagewise_schema(grid, ReadoutSpecs("r", DataKind.SCALAR))
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        z = zarr.open(str(tmp_path / "vault.zarr"), mode="r")
+        assert z["r"].chunks == expected_chunk_base
+
+    @pytest.mark.parametrize("grid,expected_chunk_base", [
+        ((4, 4), (4, 4)),
+        ((3, 4), (3, 4)),
+    ])
+    def test_chunk_shape_trace_2d(self, tmp_path, grid, expected_chunk_base):
+        schema = make_imagewise_schema(grid, ReadoutSpecs("r", DataKind.TRACE, shape=(8,)))
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        z = zarr.open(str(tmp_path / "vault.zarr"), mode="r")
+        assert z["r"].chunks == expected_chunk_base + (8,)
+
+    @pytest.mark.parametrize("grid,expected_chunk_base", [
+        ((4, 4), (4, 4)),
+        ((3, 4), (3, 4)),
+    ])
+    def test_chunk_shape_image_2d(self, tmp_path, grid, expected_chunk_base):
+        schema = make_imagewise_schema(grid, ReadoutSpecs("r", DataKind.IMAGE, shape=(3, 5)))
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        z = zarr.open(str(tmp_path / "vault.zarr"), mode="r")
+        assert z["r"].chunks == expected_chunk_base + (3, 5)
+
+    # --- 3D control grid (2, 3, 4): chunk is (1, 3, 4) + trailing ---
+
+    def test_array_creation_3d_grid(self, tmp_path):
+        a = ControlVar("a", np.arange(2, dtype=np.float32))
+        b = ControlVar("b", np.arange(3, dtype=np.float32))
+        c = ControlVar("c", np.arange(4, dtype=np.float32))
+        for ro in [
+            ReadoutSpecs("scalar", DataKind.SCALAR),
+            ReadoutSpecs("trace",  DataKind.TRACE,  shape=(8,)),
+            ReadoutSpecs("image",  DataKind.IMAGE,  shape=(3, 5)),
+        ]:
+            schema = MeasurementSchema(
+                control=[AxisSpecs([a]), AxisSpecs([b]), AxisSpecs([c])],
+                readout=[ro],
+                writetype=WriteType.IMAGEWISE,
+            )
+            ZarrWriter(root=tmp_path / ro.name, schema=schema,
+                       overwrite=True, initialize_arrays=True)
+            z = zarr.open(str(tmp_path / ro.name / "vault.zarr"), mode="r")
+            assert ro.name in z
+
+    def test_chunk_shape_3d_grid(self, tmp_path):
+        a = ControlVar("a", np.arange(2, dtype=np.float32))
+        b = ControlVar("b", np.arange(3, dtype=np.float32))
+        c = ControlVar("c", np.arange(4, dtype=np.float32))
+        schema = MeasurementSchema(
+            control=[AxisSpecs([a]), AxisSpecs([b]), AxisSpecs([c])],
+            readout=[ReadoutSpecs("r", DataKind.TRACE, shape=(8,))],
+            writetype=WriteType.IMAGEWISE,
+        )
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        z = zarr.open(str(tmp_path / "vault.zarr"), mode="r")
+        assert z["r"].chunks == (1, 3, 4, 8)
+
+    # --- write_image round-trip for non-square 2D grid ---
+
+    @pytest.mark.parametrize("grid", [(4, 4), (3, 4)])
+    def test_write_image_roundtrip_scalar(self, tmp_path, grid):
+        rows, cols = grid
+        schema = make_imagewise_schema(grid, ReadoutSpecs("r", DataKind.SCALAR))
+        writer = ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        # IMAGEWISE on 2D control: index is () — write the full plane at once
+        expected = np.random.rand(rows, cols).astype(np.float32)
+        writer.write_image((), {"r": expected})
+        z = zarr.open(str(tmp_path / "vault.zarr"), mode="r")
+        np.testing.assert_array_almost_equal(z["r"][:], expected)
+
+    @pytest.mark.parametrize("grid", [(4, 4), (3, 4)])
+    def test_write_image_roundtrip_trace(self, tmp_path, grid):
+        rows, cols = grid
+        schema = make_imagewise_schema(grid, ReadoutSpecs("r", DataKind.TRACE, shape=(8,)))
+        writer = ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        expected = np.random.rand(rows, cols, 8).astype(np.float32)
+        writer.write_image((), {"r": expected})
+        z = zarr.open(str(tmp_path / "vault.zarr"), mode="r")
+        np.testing.assert_array_almost_equal(z["r"][:], expected)
+
+
+# ===========================================================================
 # ZarrWriter — write_npzlike (tutorial "Writing npz_like")
 # ===========================================================================
 
