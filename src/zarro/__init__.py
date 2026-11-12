@@ -11,6 +11,7 @@ from .core import (
     ExperimentID,
     StreamingWriter
 )
+from .reader import Vault, VaultError, open_vault
 
 __all__ = [
     "__version__",
@@ -23,5 +24,8 @@ __all__ = [
     "ZarrWriter",
     "NpzWriter",
     "ExperimentID",
-    "StreamingWriter"
+    "StreamingWriter",
+    "Vault",
+    "VaultError",
+    "open_vault",
 ]

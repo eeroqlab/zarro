@@ -108,10 +108,10 @@ class MeasurementSchema:
     meta: dict = field(init=False)
 
     @property
-    def axis_names(self) -> dict:  # FIX: was annotated as list[str] but returns a dict
+    def axis_names(self) -> dict:
         names = {}
         for i, axis in enumerate(self.control):
-            names["axis" + str(i)] = axis.names
+            names["axis" + str(i)] = {c.name: {"unit": c.unit} for c in axis.controls}
         return names
 
     @property
