@@ -1,6 +1,20 @@
 CHANGES
 =======
 
+[2026-11-12]
+- reader: added Vault / open_vault / VaultError / Axis / Readout (src/zarro/reader.py)
+  * sweep and monitor (StreamingWriter) vaults
+  * written_mask with chunk-file mask (scalar) and non-zero heuristic (sharded trace/image)
+  * order-prefix propagation so genuine 0.0 inside scanned region stays visible
+  * custom visiting order via written_mask(..., order=array)
+  * values() returns NaN at unwritten grid points
+  * fallback control/readouts kwargs when metadata.yaml is gone
+  * backward-compatible with old list-format axis metadata
+- core: control variable units stored in new dict format {"Vch": {"unit": "V"}}
+  (reader handles both old list format and new dict format)
+- tests: added tests/test_reader.py with comprehensive reader coverage
+- docs: rewrote section 8 "Reading Data" and added reader API to section 14
+
 [2026-11-11]
 - tests: renamed TestWriteNpzlike → TestDump; replaced write_npzlike() calls
   with dump() to match the actual ZarrWriter API

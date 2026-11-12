@@ -491,44 +491,119 @@ For a fully NPZ-like workflow (no schema, no streaming), see [Section 11](#11-sc
 
 ## 8. Reading Data
 
-The vault is a standard Zarr v3 group readable by any Zarr-compatible tool:
+Use `open_vault` (or `Vault` directly) to open a run directory for analysis.
+The reader works on finished runs, interrupted runs, and runs still in progress.
+
+```python
+from zarro import open_vault
+
+run = open_vault("./data/run_001")
+
+# Kind: "sweep" for ZarrWriter runs, "monitor" for StreamingWriter runs
+print(run.kind)          # "sweep"
+print(run.shape)         # (20, 1601)
+print(run.tags)          # ["vna", "2K"]
+print(run.metadata)      # full merged dict (zarr attrs + metadata.yaml)
+```
+
+### 8.1 Control axes and coordinates
+
+```python
+# Axes, outermost first
+for ax in run.axes:
+    print(ax.index, ax.controls, ax.length, ax.units)
+    # e.g. 0  ('power',)  20  {'power': 'dBm'}
+
+# Coordinate values as numpy arrays
+freqs  = run.coords["freq"]    # shape (1601,)
+powers = run.coords["power"]   # shape (20,)
+
+# Which axis does a coordinate belong to?
+run.coord_axis["freq"]    # 1
+run.coord_axis["power"]   # 0
+```
+
+### 8.2 Readout metadata
+
+```python
+for name, r in run.readouts.items():
+    print(name, r.kind, r.shape, r.unit, r.contains)
+    # S21_mag  scalar  ()       dBm   None
+    # S21      trace   (1601,)  V     S21
+    # frame    image   (64,64)  None  None
+```
+
+### 8.3 Reading data arrays
+
+```python
+# Raw array — 0.0 where nothing has been written yet
+all_mag = run.read("S21_mag")           # shape (20, 1601)
+row_5   = run.read("S21_mag", (5,))     # shape (1601,)
+point   = run.read("S21_mag", (3, 100)) # scalar
+
+# NaN-masked array — NaN where unwritten (use this for mid-run reads)
+signal = run.values("S21_mag")          # shape (20, 1601), NaN at unwritten points
+```
+
+### 8.4 Tracking progress mid-run
+
+`written_mask` returns a boolean grid that is True where data has been written.
+It works on running sweeps without blocking the writer.
+
+```python
+mask = run.written_mask("S21_mag")       # shape == run.shape
+print(f"{mask.sum()} / {mask.size} points done")
+
+# Custom visiting order (e.g. snake sweep: row 0 L→R, row 1 R→L, ...)
+mask = run.written_mask("S21_mag", order=my_order_array)
+```
+
+**How it works:**
+
+- **Scalar** readouts are stored in plain chunks: a point is written when its
+  chunk file exists on disk.
+- **Trace/image** readouts are stored in shards: a point is written when any
+  of its values is non-zero (since zarr fills unwritten positions with 0.0).
+- In both cases, every position visited *before* the last confirmed written
+  position is also counted as written (order-prefix rule), so a genuine 0.0
+  inside the scanned region remains visible.
+
+### 8.5 Monitor runs (StreamingWriter)
+
+```python
+run = open_vault("./data/mon_001")
+print(run.kind)    # "monitor"
+print(run.shape)   # (n_samples,) — grows while the run is live
+print(run.time)    # unix timestamps, shape (n_samples,)
+
+x_values = run.values("x")   # shape (n_samples,), always fully written
+```
+
+The vault can be opened before the writer calls `close()`.
+The readout shapes are inferred automatically from the array dimensions.
+
+### 8.6 Fallback when metadata is missing
+
+If `metadata.yaml` is gone and zarr attributes were never written, pass the
+structure explicitly:
+
+```python
+run = Vault(
+    "./data/run_001",
+    control={"axis0": {"freq": {"unit": "Hz"}}, "axis1": {"power": {"unit": "dBm"}}},
+    readouts={"S21_mag": {"kind": "scalar", "unit": "dBm"}},
+)
+```
+
+### 8.7 Low-level zarr access
+
+The underlying zarr group is always accessible for direct numpy-style reads:
 
 ```python
 import zarr
-import numpy as np
-
 z = zarr.open("./data/run_001/vault.zarr", mode="r")
-
-# List all arrays
 print(list(z.keys()))
-# ['freq', 'power', 'S21_mag', 'S21_phase', 'S21_trace']
-
-# Read metadata
-attrs = dict(z.attrs)
-print(attrs["date"])
-print(attrs["tags"])
-print(attrs["schema"])
-
-# Read coordinate arrays
-freqs  = z["freq"][:]   # shape (1601,)
-powers = z["power"][:]  # shape (20,)
-
-# Read data arrays (numpy-style indexing)
-all_mag   = z["S21_mag"][:]        # shape (20, 1601)
-row_5     = z["S21_mag"][5, :]     # one power slice, all freqs
-point     = z["S21_mag"][3, 100]   # single point
-
-# Trace data
-traces    = z["S21_trace"][:]      # shape (20, 1601, 1601) for a trace readout
-```
-
-Read `metadata.yaml` directly for a human-readable summary:
-
-```python
-import yaml
-with open("./data/run_001/metadata.yaml") as f:
-    meta = yaml.safe_load(f)
-print(meta)
+all_mag = z["S21_mag"][:]     # shape (20, 1601)
 ```
 
 ---
@@ -992,6 +1067,71 @@ encode_value(x)    # numpy array/scalar → JSON-serializable Python type
 serialize(x)       # full JSON encode/decode cycle using encode_value
 compute_sharding(shape: tuple, num_shards: int) → tuple   # compute shard shape
 ```
+
+---
+
+### Reader
+
+```python
+from zarro import open_vault, Vault, VaultError
+from zarro.reader import Axis, Readout
+```
+
+#### `open_vault(path)`
+
+Convenience wrapper — returns `Vault(path)`.
+
+#### `Vault(path, *, control=None, readouts=None)`
+
+Open a run directory for reading.
+
+| Attribute | Type | Description |
+|---|---|---|
+| `kind` | `"sweep"` or `"monitor"` | Determined by presence of `_time` array |
+| `shape` | `tuple[int, ...]` | Grid shape, or `(n_samples,)` for monitors |
+| `metadata` | `dict` | zarr attrs merged with `metadata.yaml` |
+| `tags` | `list[str]` | |
+| `axes` | `list[Axis]` | Outermost axis first; empty for monitors |
+| `coords` | `dict[str, np.ndarray]` | Coordinate values per control variable |
+| `coord_axis` | `dict[str, int]` | Axis index for each control variable |
+| `readouts` | `dict[str, Readout]` | One entry per data array |
+| `time` | `np.ndarray` | Unix timestamps (monitors only) |
+
+Methods:
+
+```python
+vault.read(name, selection=Ellipsis) → np.ndarray  # 0.0 at unwritten points
+vault.values(name) → np.ndarray                    # NaN at unwritten points
+vault.written_mask(name, order=None) → np.ndarray  # bool grid
+```
+
+#### `Axis`
+
+```python
+@dataclass(frozen=True)
+class Axis:
+    index: int
+    controls: tuple[str, ...]
+    length: int
+    units: dict[str, str | None]   # {name: unit_string_or_None}
+```
+
+#### `Readout`
+
+```python
+@dataclass(frozen=True)
+class Readout:
+    name: str
+    kind: str                           # "scalar" | "trace" | "image"
+    shape: tuple[int, ...]              # trailing shape; () for scalar
+    unit: str | list[str] | None
+    contains: str | list[str] | None
+```
+
+#### `VaultError`
+
+Raised when the directory is not a readable zarro run, a required array is
+missing, or metadata cannot be parsed without fallback arguments.
 
 ---
 
