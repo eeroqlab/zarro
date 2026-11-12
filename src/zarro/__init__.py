@@ -8,7 +8,8 @@ from .core import (
     MeasurementSchema,
     ZarrWriter,
     NpzWriter,
-    ExperimentID
+    ExperimentID,
+    StreamingWriter
 )
 
 __all__ = [
@@ -21,5 +22,6 @@ __all__ = [
     "MeasurementSchema",
     "ZarrWriter",
     "NpzWriter",
-    "ExperimentID"
+    "ExperimentID",
+    "StreamingWriter"
 ]
