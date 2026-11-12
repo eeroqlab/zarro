@@ -340,6 +340,76 @@ class TestZarrWriter2D:
 
 
 # ===========================================================================
+# Dimension names (self-describing arrays, xarray-compatible)
+# ===========================================================================
+
+class TestDimensionNames:
+
+    def test_axis_dim_name_resolution(self):
+        # single control -> own name; several co-varying controls -> "trajectory"
+        assert AxisSpecs([ControlVar("only", np.zeros(3))]).dim_name == "only"
+        assert AxisSpecs([ControlVar("p", np.zeros(3)),
+                          ControlVar("q", np.zeros(3))]).dim_name == "trajectory"
+        # explicit name wins
+        assert AxisSpecs([ControlVar("p", np.zeros(3))], name="custom").dim_name == "custom"
+
+    def test_control_dims_single_and_trajectory(self):
+        # make_2d_schema: axis0 = [Vgt] (single), axis1 = [Vch, Vm] (trajectory)
+        assert make_2d_schema().control_dims == ["Vgt", "trajectory"]
+
+    def test_control_dims_deduplicated(self):
+        # two unnamed trajectory axes must not collide
+        schema = MeasurementSchema(
+            control=[AxisSpecs([ControlVar("a", np.zeros(3)), ControlVar("b", np.zeros(3))]),
+                     AxisSpecs([ControlVar("c", np.zeros(3)), ControlVar("d", np.zeros(3))])],
+            readout=[ReadoutSpecs("x", DataKind.SCALAR)],
+        )
+        assert schema.control_dims == ["trajectory0", "trajectory1"]
+
+    def test_readout_trailing_dims_scalar_trace_image(self):
+        assert ReadoutSpecs("lockin_X", DataKind.SCALAR).trailing_dims == []
+        assert ReadoutSpecs("S21", DataKind.TRACE, shape=(N_TRACE,)).trailing_dims == ["S21_i"]
+        assert ReadoutSpecs("cam", DataKind.IMAGE, shape=(4, 5)).trailing_dims == ["cam_row", "cam_col"]
+
+    def test_readout_custom_dims(self):
+        assert ReadoutSpecs("S21", DataKind.TRACE, shape=(N_TRACE,), dims=("freq",)).trailing_dims == ["freq"]
+
+    def test_readout_dims_length_mismatch_raises(self):
+        with pytest.raises(ValueError, match="dims has"):
+            ReadoutSpecs("S21", DataKind.TRACE, shape=(N_TRACE,), dims=("freq", "extra"))
+
+    def test_schema_dim_names_full(self):
+        schema = make_2d_schema()
+        assert schema.dim_names["lockin_X"] == ["Vgt", "trajectory"]
+        assert schema.dim_names["S21"] == ["Vgt", "trajectory", "S21_i"]
+
+    def test_coord_arrays_share_axis_dimension(self, tmp_path):
+        """Single-control coord -> own name; co-varying coords share the trajectory dim."""
+        schema = make_2d_schema(WriteType.ALL)
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        z = zarr.open(str(tmp_path / "vault.zarr"), mode="r")
+        assert tuple(z["Vgt"].metadata.dimension_names) == ("Vgt",)
+        # Vch and Vm co-vary on axis1 -> both lie along the shared "trajectory" dim
+        assert tuple(z["Vch"].metadata.dimension_names) == ("trajectory",)
+        assert tuple(z["Vm"].metadata.dimension_names) == ("trajectory",)
+
+    def test_data_arrays_have_control_axis_dim_names(self, tmp_path):
+        schema = make_2d_schema(WriteType.ALL)
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        z = zarr.open(str(tmp_path / "vault.zarr"), mode="r")
+        # scalar: control dims only
+        assert tuple(z["lockin_X"].metadata.dimension_names) == ("Vgt", "trajectory")
+        # trace: control dims + readout-local trailing dim
+        assert tuple(z["S21"].metadata.dimension_names) == ("Vgt", "trajectory", "S21_i")
+
+    def test_add_array_dimension_names(self, tmp_path):
+        writer = ZarrWriter(root=tmp_path, overwrite=True)
+        writer.add_array("Freqs", np.linspace(4e9, 8e9, N_TRACE), dims=["Freqs"])
+        z = zarr.open(str(tmp_path / "vault.zarr"), mode="r")
+        assert tuple(z["Freqs"].metadata.dimension_names) == ("Freqs",)
+
+
+# ===========================================================================
 # ZarrWriter — 1D scan (mirrors tutorial "Examples of 1D scans")
 # ===========================================================================
 

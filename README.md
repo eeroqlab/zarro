@@ -72,9 +72,34 @@ Read the data back:
 import zarr
 
 z = zarr.open("./data/run_001/vault.zarr", mode="r")
-print(list(z.keys()))       # ['freq', 'power', 'S21']
-print(dict(z.attrs))        # metadata dict
-s21 = z["S21"][:]           # numpy array, shape (20, 1601)
+print(list(z.keys()))                       # ['freq', 'power', 'S21']
+print(dict(z.attrs))                        # metadata dict
+s21 = z["S21"][:]                           # numpy array, shape (20, 1601)
+print(z["S21"].metadata.dimension_names)    # ('power', 'freq')
+```
+
+### Dimension names
+
+Arrays are written with Zarr v3 `dimension_names`, derived from the schema, so
+the data is self-describing (and loads straight into xarray with named dims):
+
+- **Control axes** — each axis becomes one dimension. An axis with a single
+  control is named after that control (e.g. `freq`); an axis with several
+  co-varying controls (a trajectory through parameter space) is named
+  `trajectory`. Give it a meaningful name with `AxisSpecs([...], name="sweep_path")`.
+- **Data arrays** — leading dimensions are the control axis names; trailing
+  dimensions are named per readout (`"<name>_i"` for traces,
+  `"<name>_row"`/`"<name>_col"` for images). Override the trailing names with
+  `ReadoutSpecs(..., dims=("freq",))`.
+- **1-D coordinate arrays** — each lies along its axis's dimension. For a
+  single-control axis that is the control's own name (so xarray picks it up as an
+  index coordinate); co-varying controls share the axis dimension and attach as
+  coordinates on it.
+
+```python
+import xarray as xr
+
+xr.open_zarr("./data/run_001/vault.zarr")   # dims: power, freq — already labelled
 ```
 
 ## Documentation
