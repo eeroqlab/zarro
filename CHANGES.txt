@@ -14,6 +14,9 @@ CHANGES
   (reader handles both old list format and new dict format)
 - tests: added tests/test_reader.py with comprehensive reader coverage
 - docs: rewrote section 8 "Reading Data" (8 subsections) and added reader API to section 14
+- reader: open_vault now accepts a 4-digit experiment ID; searches the parent
+  directory for a folder whose name starts with that ID (e.g. "0007_blabla"
+  matches "0007"); raises VaultError on no match or ambiguous match
 - reader: added Vault.snapshot() — tabulate-formatted summary (kind, shape, date, tags,
   control axes with units, readouts with kind/shape/unit/contains); plain-text fallback
   when tabulate is not installed

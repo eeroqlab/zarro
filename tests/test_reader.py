@@ -104,39 +104,37 @@ class TestVaultStructure1D:
         v = Vault(tmp_path)
         assert v.shape == (N_B,)
 
-    def test_one_axis_two_controls(self, tmp_path):
+    def test_two_variables_on_same_dim(self, tmp_path):
         schema = make_1d_schema()
         ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
         v = Vault(tmp_path)
-        assert len(v.axes) == 1
-        ax = v.axes[0]
-        assert ax.index == 0
-        assert ax.controls == ("c", "d")
-        assert ax.length == N_B
+        assert set(v.axes.keys()) == {"c", "d"}
+        assert v.axes["c"].dim == 0
+        assert v.axes["d"].dim == 0
+        assert v.axes["c"].length == N_B
 
     def test_units_on_multi_control_axis(self, tmp_path):
         schema = make_1d_schema()
         ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
         v = Vault(tmp_path)
-        assert v.axes[0].units["c"] == "T"
-        assert v.axes[0].units["d"] is None
+        assert v.axes["c"].unit == "T"
+        assert v.axes["d"].unit is None
 
-    def test_coords_shape_and_values(self, tmp_path):
+    def test_values_shape_and_content(self, tmp_path):
         schema = make_1d_schema()
         ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
         v = Vault(tmp_path)
-        assert set(v.coords.keys()) == {"c", "d"}
-        assert v.coords["c"].shape == (N_B,)
+        assert v.axes["c"].values.shape == (N_B,)
         np.testing.assert_array_almost_equal(
-            v.coords["c"], np.linspace(0, 2, N_B, dtype=np.float32)
+            v.axes["c"].values, np.linspace(0, 2, N_B, dtype=np.float32)
         )
 
-    def test_coord_axis_mapping(self, tmp_path):
+    def test_dim_attribute(self, tmp_path):
         schema = make_1d_schema()
         ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
         v = Vault(tmp_path)
-        assert v.coord_axis["c"] == 0
-        assert v.coord_axis["d"] == 0
+        assert v.axes["c"].dim == 0
+        assert v.axes["d"].dim == 0
 
     def test_readout_kinds_and_shapes(self, tmp_path):
         schema = make_1d_schema()
@@ -164,25 +162,23 @@ class TestVaultStructure2D:
         schema = make_2d_schema()
         ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
         v = Vault(tmp_path)
-        assert len(v.axes) == 2
-        assert v.axes[0].controls == ("a",)
-        assert v.axes[1].controls == ("b",)
-        assert v.axes[0].length == N_A
-        assert v.axes[1].length == N_B
+        assert set(v.axes.keys()) == {"a", "b"}
+        assert v.axes["a"].length == N_A
+        assert v.axes["b"].length == N_B
 
     def test_axis_units(self, tmp_path):
         schema = make_2d_schema()
         ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
         v = Vault(tmp_path)
-        assert v.axes[0].units["a"] == "V"
-        assert v.axes[1].units["b"] == "Hz"
+        assert v.axes["a"].unit == "V"
+        assert v.axes["b"].unit == "Hz"
 
-    def test_coord_axis_mapping(self, tmp_path):
+    def test_dim_attribute(self, tmp_path):
         schema = make_2d_schema()
         ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
         v = Vault(tmp_path)
-        assert v.coord_axis["a"] == 0
-        assert v.coord_axis["b"] == 1
+        assert v.axes["a"].dim == 0
+        assert v.axes["b"].dim == 1
 
     def test_scalar_readout_unit(self, tmp_path):
         schema = make_2d_schema()
@@ -275,6 +271,89 @@ class TestVaultData:
         w.write_metadata()
         v = Vault(tmp_path)
         np.testing.assert_array_almost_equal(v.values("x"), expected)
+
+
+# ===========================================================================
+# TestComponent — component= kwarg on read() and values()
+# ===========================================================================
+
+def make_image_schema_with_layers():
+    """3-layer IMAGE readout: contains=['fpts','mag','phase'], shape=(3, N_T)."""
+    a = ControlVar("a", np.linspace(0, 1, N_A, dtype=np.float32))
+    b = ControlVar("b", np.linspace(0, 1, N_B, dtype=np.float32))
+    return MeasurementSchema(
+        control=[AxisSpecs([a]), AxisSpecs([b])],
+        readout=[
+            ReadoutSpecs("res", DataKind.IMAGE, shape=(3, N_T),
+                         unit=["Hz", "dBm", "deg"],
+                         contains=["fpts", "mag", "phase"]),
+            ReadoutSpecs("scalar", DataKind.SCALAR),
+        ],
+        writetype=WriteType.POINTWISE,
+    )
+
+
+def write_full_image_layers(tmp_path):
+    schema = make_image_schema_with_layers()
+    w = ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+    rng = np.random.default_rng(42)
+    data = rng.random((N_A, N_B, 3, N_T), dtype=np.float32)
+    for i in range(N_A):
+        for j in range(N_B):
+            w.write_point((i, j), {"res": data[i, j], "scalar": 1.0})
+    w.write_metadata()
+    return data
+
+
+class TestComponent:
+
+    def test_read_component_full_shape(self, tmp_path):
+        data = write_full_image_layers(tmp_path)
+        v = Vault(tmp_path)
+        mag = v.read("res", component="mag")
+        assert mag.shape == (N_A, N_B, N_T)
+        np.testing.assert_array_almost_equal(mag, data[:, :, 1, :])
+
+    def test_read_component_with_selection(self, tmp_path):
+        data = write_full_image_layers(tmp_path)
+        v = Vault(tmp_path)
+        mag = v.read("res", (0,), component="mag")
+        assert mag.shape == (N_B, N_T)
+        np.testing.assert_array_almost_equal(mag, data[0, :, 1, :])
+
+    def test_read_component_point_selection(self, tmp_path):
+        data = write_full_image_layers(tmp_path)
+        v = Vault(tmp_path)
+        mag = v.read("res", (0, 1), component="mag")
+        assert mag.shape == (N_T,)
+        np.testing.assert_array_almost_equal(mag, data[0, 1, 1, :])
+
+    def test_values_component_no_nan_full_run(self, tmp_path):
+        data = write_full_image_layers(tmp_path)
+        v = Vault(tmp_path)
+        mag = v.values("res", component="mag")
+        assert mag.shape == (N_A, N_B, N_T)
+        assert not np.isnan(mag).any()
+        np.testing.assert_array_almost_equal(mag, data[:, :, 1, :])
+
+    def test_all_layer_names_selectable(self, tmp_path):
+        data = write_full_image_layers(tmp_path)
+        v = Vault(tmp_path)
+        for idx, name in enumerate(["fpts", "mag", "phase"]):
+            result = v.read("res", component=name)
+            np.testing.assert_array_almost_equal(result, data[:, :, idx, :])
+
+    def test_component_on_scalar_raises(self, tmp_path):
+        write_full_image_layers(tmp_path)
+        v = Vault(tmp_path)
+        with pytest.raises(VaultError, match="no named components"):
+            v.read("scalar", component="mag")
+
+    def test_unknown_component_raises(self, tmp_path):
+        write_full_image_layers(tmp_path)
+        v = Vault(tmp_path)
+        with pytest.raises(VaultError, match="not found"):
+            v.read("res", component="nonexistent")
 
 
 # ===========================================================================
@@ -558,8 +637,8 @@ class TestFallbacks:
         }
         v = Vault(tmp_path, control=control, readouts=readouts)
         assert v.shape == (N_A, N_B)
-        assert v.axes[0].controls == ("a",)
-        assert v.axes[0].units["a"] == "V"
+        assert "a" in v.axes
+        assert v.axes["a"].unit == "V"
         assert v.readouts["scalar"].kind == "scalar"
 
     def test_no_metadata_no_fallback_raises_vault_error(self, tmp_path):
@@ -597,6 +676,49 @@ class TestErrors:
         ).write_metadata()
         v = open_vault(tmp_path)
         assert v.shape == (N_A, N_B)
+
+    def test_open_vault_by_4digit_id(self, tmp_path):
+        folder = tmp_path / "0007_blabla"
+        folder.mkdir()
+        schema = make_2d_schema()
+        ZarrWriter(
+            root=folder, schema=schema, overwrite=True, initialize_arrays=True
+        ).write_metadata()
+        v = open_vault(tmp_path / "0007")
+        assert v.shape == (N_A, N_B)
+
+    def test_open_vault_by_int_id(self, tmp_path):
+        folder = tmp_path / "0007_blabla"
+        folder.mkdir()
+        schema = make_2d_schema()
+        ZarrWriter(
+            root=folder, schema=schema, overwrite=True, initialize_arrays=True
+        ).write_metadata()
+        # int 7 from parent dir: not useful alone, but covered via path
+        v = open_vault(tmp_path / "0007")
+        assert v.shape == (N_A, N_B)
+
+    def test_open_vault_exact_match_preferred(self, tmp_path):
+        exact = tmp_path / "0007"
+        exact.mkdir()
+        schema = make_2d_schema()
+        ZarrWriter(
+            root=exact, schema=schema, overwrite=True, initialize_arrays=True
+        ).write_metadata()
+        # also create a suffixed sibling; exact path should win without ambiguity error
+        (tmp_path / "0007_other").mkdir()
+        v = open_vault(exact)
+        assert v.shape == (N_A, N_B)
+
+    def test_open_vault_id_no_match_raises(self, tmp_path):
+        with pytest.raises(VaultError, match="no directory"):
+            open_vault(tmp_path / "0099")
+
+    def test_open_vault_id_ambiguous_raises(self, tmp_path):
+        (tmp_path / "0007_foo").mkdir()
+        (tmp_path / "0007_bar").mkdir()
+        with pytest.raises(VaultError, match="ambiguous"):
+            open_vault(tmp_path / "0007")
 
     def test_vault_repr(self, tmp_path):
         schema = make_2d_schema()

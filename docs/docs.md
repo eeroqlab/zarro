@@ -552,19 +552,30 @@ back to a plain-text table when it is not installed.
 
 ### 8.2 Control axes and coordinates
 
+``run.axes`` is a ``dict[str, Axis]`` keyed by variable name.
+Each entry has ``.values``, ``.unit``, ``.length``, and ``.dim`` (the grid
+dimension index it spans).
+
 ```python
-# Axes, outermost first
-for ax in run.axes:
-    print(ax.index, ax.controls, ax.length, ax.units)
-    # e.g. 0  ('power',)  20  {'power': 'dBm'}
+# Look up a variable directly
+run.axes["freq"].values   # coordinate array, shape (1601,)
+run.axes["freq"].unit     # "Hz"
+run.axes["freq"].length   # 1601
+run.axes["freq"].dim      # 1  — which dimension of the grid
 
-# Coordinate values as numpy arrays
-freqs  = run.coords["freq"]    # shape (1601,)
-powers = run.coords["power"]   # shape (20,)
+run.axes["power"].dim     # 0
 
-# Which axis does a coordinate belong to?
-run.coord_axis["freq"]    # 1
-run.coord_axis["power"]   # 0
+# Iterate over all control variables
+for name, ax in run.axes.items():
+    print(name, ax.dim, ax.length, ax.unit)
+```
+
+For a **multi-control axis** (two variables swept together on the same grid
+dimension), both entries share the same ``.dim``:
+
+```python
+run.axes["Vch"].dim   # 0
+run.axes["Vm"].dim    # 0  — moved in lockstep with Vch
 ```
 
 ### 8.3 Readout metadata
@@ -587,6 +598,21 @@ point   = run.read("S21_mag", (3, 100)) # scalar
 
 # NaN-masked array — NaN where unwritten (use this for mid-run reads)
 signal = run.values("S21_mag")          # shape (20, 1601), NaN at unwritten points
+```
+
+#### Selecting a named component (IMAGE readouts)
+
+When an IMAGE readout has `contains` as a list of layer names, use
+`component=` to extract one layer.  The layer dimension is removed from the
+result.
+
+```python
+# resonance: shape (20, 1601, 3, 801), contains=['fpts','mag','phase']
+run.read("resonance", component="mag")          # shape (20, 1601, 801)
+run.read("resonance", (5,), component="mag")    # shape (1601, 801)  — row 5
+run.values("resonance", component="mag")        # shape (20, 1601, 801), NaN at unwritten
+
+# passing component= to a SCALAR or TRACE readout raises VaultError
 ```
 
 ### 8.5 Tracking progress mid-run
@@ -1135,31 +1161,35 @@ Open a run directory for reading.
 | `shape` | `tuple[int, ...]` | Grid shape, or `(n_samples,)` for monitors |
 | `metadata` | `dict` | zarr attrs merged with `metadata.yaml` |
 | `tags` | `list[str]` | |
-| `axes` | `list[Axis]` | Outermost axis first; empty for monitors |
-| `coords` | `dict[str, np.ndarray]` | Coordinate values per control variable |
-| `coord_axis` | `dict[str, int]` | Axis index for each control variable |
+| `axes` | `dict[str, Axis]` | Keyed by variable name; empty for monitors |
 | `readouts` | `dict[str, Readout]` | One entry per data array |
 | `time` | `np.ndarray` | Unix timestamps (monitors only) |
 
 Methods:
 
 ```python
-vault.read(name, selection=Ellipsis) → np.ndarray  # 0.0 at unwritten points
-vault.values(name) → np.ndarray                    # NaN at unwritten points
-vault.written_mask(name, order=None) → np.ndarray  # bool grid
-vault.snapshot()                                    # print formatted summary
+vault.read(name, selection=Ellipsis, *, component=None) → np.ndarray  # 0.0 at unwritten
+vault.values(name, *, component=None) → np.ndarray                    # NaN at unwritten
+vault.written_mask(name, order=None) → np.ndarray                     # bool grid
+vault.snapshot()                                                        # print summary
+
+# component= selects one named layer of an IMAGE readout whose contains is a list.
+# The layer dimension is removed from the result.
 ```
 
 #### `Axis`
 
 ```python
-@dataclass(frozen=True)
+@dataclass
 class Axis:
-    index: int
-    controls: tuple[str, ...]
+    name: str
+    values: np.ndarray        # coordinate array, shape (length,)
+    unit: str | None
     length: int
-    units: dict[str, str | None]   # {name: unit_string_or_None}
+    dim: int                  # grid dimension this variable spans
 ```
+
+Variables on a multi-control axis share the same ``dim`` value.
 
 #### `Readout`
 

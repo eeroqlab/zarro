@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+import re
 from pathlib import Path
 
 import numpy as np
@@ -38,14 +39,20 @@ class VaultError(Exception):
     """The directory is not a readable zarro run."""
 
 
-@dataclass(frozen=True)
+@dataclass
 class Axis:
-    """One control axis. A multi-control axis has several ``controls`` sharing one length."""
+    """One control variable and its sweep coordinates.
 
-    index: int
-    controls: tuple[str, ...]
+    ``run.axes`` is a ``dict[str, Axis]`` keyed by variable name.
+    For a multi-control axis (two variables swept together on the same grid
+    dimension), both entries share the same ``dim`` value.
+    """
+
+    name: str
+    values: np.ndarray   # coordinate array, shape (length,)
+    unit: str | None
     length: int
-    units: dict[str, str | None] = None  # {name: unit_string_or_None}
+    dim: int             # index of the grid dimension this variable spans
 
 
 @dataclass(frozen=True)
@@ -108,9 +115,9 @@ class Vault:
     metadata : metadata.yaml merged over the zarr attributes. The attributes are
         written when the writer finishes; metadata.yaml exists from the start.
     tags : list of str
-    axes : control axes, outermost first (empty for monitors).
-    coords : ``{control name: values}`` for every control variable.
-    coord_axis : ``{control name: axis index}``.
+    axes : ``dict[str, Axis]`` keyed by variable name (empty for monitors).
+        ``run.axes["Vch"].values``, ``.unit``, ``.length``, ``.dim``.
+        Variables sharing a grid dimension have the same ``.dim`` value.
     readouts : ``{name: Readout}``.
     """
 
@@ -128,9 +135,7 @@ class Vault:
         self.tags = list(self.metadata.get("tags") or [])
         self.kind = "monitor" if "_time" in self._group else "sweep"
 
-        self.axes: list[Axis] = []
-        self.coords: dict[str, np.ndarray] = {}
-        self.coord_axis: dict[str, int] = {}
+        self.axes: dict[str, Axis] = {}
         self.readouts: dict[str, Readout] = {}
 
         if self.kind == "sweep":
@@ -146,6 +151,7 @@ class Vault:
         if not control:
             raise VaultError(f"{self.path}: no control axes in metadata.yaml, the zarr attributes or the arguments")
         for key in sorted(control, key=lambda k: int(str(k).removeprefix("axis"))):
+            dim = int(str(key).removeprefix("axis"))
             value = control[key]
             if isinstance(value, list):          # old format: ["Vch", "Vm"]
                 names = tuple(value)
@@ -156,11 +162,9 @@ class Vault:
             missing = [n for n in names if n not in self._group]
             if missing:
                 raise VaultError(f"{self.path}: coordinate array(s) {missing} not found in vault.zarr")
-            values = {n: np.asarray(self._group[n][:]) for n in names}
-            self.axes.append(Axis(len(self.axes), names, len(values[names[0]]), units))
             for n in names:
-                self.coords[n] = values[n]
-                self.coord_axis[n] = len(self.axes) - 1
+                arr = np.asarray(self._group[n][:])
+                self.axes[n] = Axis(name=n, values=arr, unit=units[n], length=len(arr), dim=dim)
 
     def _load_readouts(self, fallback: dict | None) -> None:
         schema = self.metadata.get("schema")
@@ -168,7 +172,7 @@ class Vault:
         specs = specs or fallback
         if not specs:
             names = list(self.metadata.get("readouts") or []) or [
-                n for n in self._group.array_keys() if n != "_time" and n not in self.coords
+                n for n in self._group.array_keys() if n != "_time" and n not in self.axes
             ]
             specs = {n: {} for n in names}
         lead = len(self.shape) if self.kind == "sweep" else 1
@@ -189,7 +193,10 @@ class Vault:
         """Sweep grid shape, or ``(n_samples,)`` for a monitor (n grows while it runs)."""
         if self.kind == "monitor":
             return (int(self._group["_time"].shape[0]),)
-        return tuple(a.length for a in self.axes)
+        dim_length: dict[int, int] = {}
+        for ax in self.axes.values():
+            dim_length.setdefault(ax.dim, ax.length)
+        return tuple(dim_length[d] for d in sorted(dim_length))
 
     @property
     def time(self) -> np.ndarray:
@@ -200,13 +207,50 @@ class Vault:
 
     # ── data ──────────────────────────────────────────────────────────
 
-    def read(self, name: str, selection=Ellipsis) -> np.ndarray:
-        """Read a readout, indexed like the sweep grid, with ``0.0`` where nothing is written yet."""
-        return np.asarray(self._group[name][selection])
+    def read(self, name: str, selection=Ellipsis, *, component: str | None = None) -> np.ndarray:
+        """Read a readout, indexed like the sweep grid, with ``0.0`` where nothing is written yet.
 
-    def values(self, name: str) -> np.ndarray:
-        """Whole readout as floats, NaN where nothing has been written yet."""
-        raw = self.read(name)
+        Parameters
+        ----------
+        component : str, optional
+            For IMAGE readouts whose ``contains`` is a list of named layers,
+            select one layer by name.  Returns the array with that layer's
+            trailing dimension removed.  Example: ``component="mag"`` on a
+            readout with ``contains=['fpts', 'mag', 'phase']`` and shape
+            ``(3, 1601)`` gives an array of shape ``(sweep_grid..., 1601)``.
+        """
+        raw = np.asarray(self._group[name][selection])
+        if component is not None:
+            raw = self._select_component(name, component, raw)
+        return raw
+
+    def _select_component(self, name: str, component: str, data: np.ndarray) -> np.ndarray:
+        r = self.readouts.get(name)
+        contains = r.contains if r is not None else None
+        if not isinstance(contains, list):
+            raise VaultError(
+                f"readout '{name}' has no named components "
+                f"(contains={contains!r}); component= is only valid when contains is a list"
+            )
+        if component not in contains:
+            raise VaultError(
+                f"component '{component}' not found in '{name}'; "
+                f"available: {contains}"
+            )
+        idx = contains.index(component)
+        # IMAGE always has 2 trailing dims: (n_layers, n_points).
+        # After any selection the layer axis is always data.ndim - 2.
+        return np.take(data, idx, axis=data.ndim - 2)
+
+    def values(self, name: str, *, component: str | None = None) -> np.ndarray:
+        """Whole readout as floats, NaN where nothing has been written yet.
+
+        Parameters
+        ----------
+        component : str, optional
+            Select one named layer of an IMAGE readout (see :meth:`read`).
+        """
+        raw = self.read(name, component=component)
         out = raw.astype(raw.dtype if raw.dtype.kind == "f" else float)
         mask = self.written_mask(name)
         if not mask.all():
@@ -302,10 +346,8 @@ class Vault:
         if self.kind == "sweep":
             print()
             axis_rows = []
-            for ax in self.axes:
-                for name in ax.controls:
-                    unit = (ax.units or {}).get(name) or "—"
-                    axis_rows.append([f"axis{ax.index}", name, ax.length, unit])
+            for ax in self.axes.values():
+                axis_rows.append([f"dim{ax.dim}", ax.name, ax.length, ax.unit or "—"])
             _print_table(
                 axis_rows,
                 headers=["axis", "variable", "length", "unit"],
@@ -340,5 +382,35 @@ class Vault:
 
 
 def open_vault(path: str | Path) -> Vault:
-    """Open the run directory at *path* for reading."""
+    """Open the run directory at *path* for reading.
+
+    *path* may be an exact directory path **or** a 4-digit experiment ID (as a
+    string like ``"0007"`` or an int like ``7``).  When the exact path does not
+    exist and its final component is a 4-digit ID, the parent directory is
+    searched for a folder whose name starts with that ID (e.g. ``"0007_blabla"``
+    also matches ``"0007"``).  A :class:`VaultError` is raised if no match or
+    more than one match is found.
+    """
+    if isinstance(path, int):
+        path = Path(f"{path:04d}")
+    path = Path(path)
+    if not path.exists():
+        stem = path.name
+        if re.fullmatch(r"\d{4}", stem):
+            parent = path.parent
+            matches = [
+                d for d in parent.iterdir()
+                if d.is_dir() and (d.name == stem or d.name.startswith(stem + "_"))
+            ]
+            if len(matches) == 1:
+                path = matches[0]
+            elif len(matches) == 0:
+                raise VaultError(
+                    f"no directory matching '{stem}*' found in {parent}"
+                )
+            else:
+                names = sorted(m.name for m in matches)
+                raise VaultError(
+                    f"ambiguous experiment ID '{stem}': found {names}"
+                )
     return Vault(path)
