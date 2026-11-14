@@ -278,15 +278,18 @@ class TestVaultData:
 # ===========================================================================
 
 def make_image_schema_with_layers():
-    """3-layer IMAGE readout: contains=['fpts','mag','phase'], shape=(3, N_T)."""
+    """3-layer IMAGE readout using trailing_dims for component names and per-label units."""
     a = ControlVar("a", np.linspace(0, 1, N_A, dtype=np.float32))
     b = ControlVar("b", np.linspace(0, 1, N_B, dtype=np.float32))
     return MeasurementSchema(
         control=[AxisSpecs([a]), AxisSpecs([b])],
         readout=[
             ReadoutSpecs("res", DataKind.IMAGE, shape=(3, N_T),
-                         unit=["Hz", "dBm", "deg"],
-                         contains=["fpts", "mag", "phase"]),
+                         trailing_dims=[
+                             {"name": "component", "values": ["fpts", "mag", "phase"],
+                              "units": ["Hz", "dBm", "deg"]},
+                             {"name": "sample"},
+                         ]),
             ReadoutSpecs("scalar", DataKind.SCALAR),
         ],
         writetype=WriteType.POINTWISE,
@@ -1056,6 +1059,99 @@ class TestTrailingDims:
         v = Vault(tmp_path)
         da = v.to_xarray("S21")
         assert "freq" in da.coords
+
+    def test_component_units_in_xarray_attrs(self, tmp_path):
+        """'units' list in trailing_dim dict surfaces as component_units attr in DataArray."""
+        write_full_image_layers(tmp_path)
+        v = Vault(tmp_path)
+        da = v.to_xarray("res")
+        assert "component_units" in da.attrs
+        cu = da.attrs["component_units"]
+        assert cu["fpts"] == "Hz"
+        assert cu["mag"] == "dBm"
+        assert cu["phase"] == "deg"
+
+    def test_component_units_absent_after_component_selection(self, tmp_path):
+        """component_units attr is not set when the component dim was selected away."""
+        write_full_image_layers(tmp_path)
+        v = Vault(tmp_path)
+        da = v.to_xarray("res", component="mag")
+        assert "component_units" not in da.attrs
+
+
+# ===========================================================================
+# TestContainsPromotion — contains-as-list auto-promotes to trailing_dims
+# ===========================================================================
+
+class TestContainsPromotion:
+
+    def _make_schema_contains_only(self):
+        """Schema using the old contains=list style (no explicit trailing_dims)."""
+        a = ControlVar("a", np.linspace(0, 1, N_A, dtype=np.float32))
+        b = ControlVar("b", np.linspace(0, 1, N_B, dtype=np.float32))
+        return MeasurementSchema(
+            control=[AxisSpecs([a]), AxisSpecs([b])],
+            readout=[
+                ReadoutSpecs("lockin", DataKind.TRACE, shape=(2,),
+                             contains=["X", "Y"]),
+            ],
+            writetype=WriteType.POINTWISE,
+        )
+
+    def test_trailing_dims_set_after_promotion(self):
+        """MeasurementSchema.__post_init__ populates trailing_dims on the ReadoutSpecs."""
+        schema = self._make_schema_contains_only()
+        r = schema.readout[0]
+        assert r.trailing_dims is not None
+        assert r.trailing_dims[0]["name"] == "component"
+        assert r.trailing_dims[0]["values"] == ["X", "Y"]
+
+    def test_component_labels_in_metadata(self, tmp_path):
+        """Auto-promoted labels appear in metadata.yaml trailing_dims."""
+        schema = self._make_schema_contains_only()
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
+        import yaml
+        meta = yaml.safe_load((tmp_path / "metadata.yaml").read_text())
+        td = meta["readout"]["lockin"]["trailing_dims"]
+        assert any(d["name"] == "component" and d.get("values") == ["X", "Y"] for d in td)
+
+    def test_component_labels_loadable_via_trailing_coords(self, tmp_path):
+        """Vault.trailing_coords picks up auto-promoted string labels."""
+        schema = self._make_schema_contains_only()
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
+        v = Vault(tmp_path)
+        assert "lockin" in v.trailing_coords
+        np.testing.assert_array_equal(v.trailing_coords["lockin"]["component"], ["X", "Y"])
+
+    def test_select_component_works_via_trailing_coords(self, tmp_path):
+        """component= selection works for readouts with no contains but trailing_dims set."""
+        schema = self._make_schema_contains_only()
+        rng = np.random.default_rng(1)
+        data = rng.random((N_A, N_B, 2), dtype=np.float32)
+        w = ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        for i in range(N_A):
+            for j in range(N_B):
+                w.write_point((i, j), {"lockin": data[i, j]})
+        w.write_metadata()
+        v = Vault(tmp_path)
+        result = v.read("lockin", component="X")
+        assert result.shape == (N_A, N_B)
+        np.testing.assert_array_almost_equal(result, data[:, :, 0])
+
+    def test_to_xarray_dims_from_auto_promotion(self, tmp_path):
+        """to_xarray uses the auto-promoted trailing_dims for dim names and coords."""
+        schema = self._make_schema_contains_only()
+        rng = np.random.default_rng(2)
+        data = rng.random((N_A, N_B, 2), dtype=np.float32)
+        w = ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        for i in range(N_A):
+            for j in range(N_B):
+                w.write_point((i, j), {"lockin": data[i, j]})
+        w.write_metadata()
+        v = Vault(tmp_path)
+        da = v.to_xarray("lockin")
+        assert "component" in da.dims
+        np.testing.assert_array_equal(da.coords["component"].values, ["X", "Y"])
 
 
 # ===========================================================================

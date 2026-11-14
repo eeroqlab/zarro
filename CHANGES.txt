@@ -2,12 +2,25 @@ CHANGES
 =======
 
 [2026-11-14]
+- core: ReadoutSpecs.unit is now str only; list[str] removed (per-component units
+  go in trailing_dims as "units" key)
+- core: contains-as-list auto-promotes to trailing_dims=[{"name":"component","values":...}]
+  in MeasurementSchema.__post_init__; old code using contains=["X","Y"] continues to work
+- core: _keep_in_meta moved to module level (was re-defined every loop iteration)
+- core/reader: trailing_dims dict now supports "units": list[str] for per-component units;
+  Vault.trailing_units loaded on open; to_xarray attaches da.attrs["component_units"]
+  as a {label: unit} dict when present
+- reader: _select_component falls back to trailing_coords["component"] when contains
+  is None, so component= selection works without an explicit contains list
 - reader: fix _select_component layer_axis for TRACE readouts with shape=(N,)
   and contains as a list; previously used hardcoded data.ndim-2 (IMAGE assumption),
   now uses data.ndim - len(r.shape) so TRACE layers are selected correctly
 - docs: document trailing_dims in ReadoutSpecs (§3.3, §14), to_xarray trailing_coords=
   kwarg (§8.5, §14), Vault.dim_names property (§14), sweep/step/frame/volume roles
   in snapshot() example (§8.1), and Readout.trailing_dims field (§14)
+- docs: §3.3 updated — unit is string only, contains-as-list shorthand documented,
+  "units" key in trailing_dims documented with per-label unit example; §5.2, §5.3,
+  §8.4, §8.5, §14 updated to match
 
 [2026-11-12]
 - reader: added Vault / open_vault / VaultError / Axis / Readout (src/zarro/reader.py)

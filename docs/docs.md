@@ -221,35 +221,48 @@ frame = ReadoutSpecs(
 |---|---|---|
 | `name` | `str` | Array key in vault |
 | `kind` | `DataKind` | SCALAR, TRACE, or IMAGE |
-| `unit` | `str \| list[str]` | Physical unit(s) |
+| `unit` | `str` | Physical unit of the readout |
 | `shape` | `tuple[int, ...]` | **Required** for TRACE and IMAGE: trailing dimension sizes |
-| `contains` | `str \| list[str]` | Human description of what is measured |
+| `contains` | `str \| list[str]` | Human description, or list of component names (auto-promotes to `trailing_dims`) |
 | `trailing_dims` | `list[dict]` | Named trailing dimensions (see below) |
 
-`trailing_dims` is an ordered list of dicts, one per trailing dimension, from outermost to innermost.  Each dict may contain `name` (str), `unit` (str), and `values` (list or ndarray) for coordinate labels.  String `values` (e.g. component names) are stored in `metadata.yaml`; numeric `values` (e.g. frequency arrays) are written as a companion zarr array `{readout}.{dim_name}` for automatic use by `to_xarray`.
+`trailing_dims` is an ordered list of dicts, one per trailing dimension, from outermost to innermost.  Each dict may contain:
+
+| Key | Type | Description |
+|---|---|---|
+| `name` | `str` | Dimension name used in xarray (`"freq"`, `"component"`, …) |
+| `unit` | `str` | Physical unit for a homogeneous axis (e.g. `"Hz"`) |
+| `values` | `list` or `ndarray` | Coordinate values. String lists go in `metadata.yaml`; numeric arrays are stored as `{readout}.{dim_name}` in vault.zarr |
+| `units` | `list[str]` | Per-label units for a component dimension (one entry per value) |
+
+**Component shorthand** — passing `contains` as a list automatically creates the equivalent `trailing_dims` entry at schema build time, so the two forms below are identical:
 
 ```python
-# TRACE with named frequency axis
-s21 = ReadoutSpecs(
-    name="S21",
-    kind=DataKind.TRACE,
-    shape=(1601,),
-    unit="dBm",
-    trailing_dims=[
-        {"name": "freq", "unit": "Hz", "values": np.linspace(4e9, 8e9, 1601)},
-    ],
-)
+# shorthand (old style — still supported)
+ReadoutSpecs("lockin_xy", DataKind.TRACE, shape=(2,), contains=["X", "Y"])
 
-# IMAGE with named component layers and a spatial axis
-result = ReadoutSpecs(
-    name="resonance",
-    kind=DataKind.IMAGE,
+# explicit (new style — required when adding per-label units)
+ReadoutSpecs(
+    "lockin_xy", DataKind.TRACE, shape=(2,),
+    trailing_dims=[{"name": "component", "values": ["X", "Y"]}],
+)
+```
+
+**Per-label units** on a component dim — use `"units"` (a list) instead of `"unit"` (a string):
+
+```python
+ReadoutSpecs(
+    "resonance",
+    DataKind.IMAGE,
     shape=(3, 801),
     trailing_dims=[
-        {"name": "component", "values": ["fpts", "mag", "phase"]},
+        {"name": "component", "values": ["fpts", "mag", "phase"],
+         "units": ["Hz", "dBm", "deg"]},          # one unit per label
         {"name": "freq", "unit": "Hz", "values": np.linspace(4e9, 8e9, 801)},
     ],
 )
+# → run.to_xarray("resonance").attrs["component_units"]
+#   == {"fpts": "Hz", "mag": "dBm", "phase": "deg"}
 ```
 
 ### 3.4 MeasurementSchema
@@ -433,15 +446,18 @@ ReadoutSpecs(
 # → run.to_xarray("S21") has dims ("power", "freq") with freq coords attached
 ```
 
-A TRACE whose samples represent named channels (e.g. lock-in X/Y) uses a string `values` list. String labels are stored in `metadata.yaml` only (no extra zarr array):
+A TRACE whose samples represent named channels (e.g. lock-in X/Y) uses a string `values` list. String labels are stored in `metadata.yaml` only (no extra zarr array).  The `contains`-as-list shorthand auto-promotes to this form at schema build time:
 
 ```python
+# shorthand — identical to explicit trailing_dims below
+ReadoutSpecs("lockin_xy", DataKind.TRACE, shape=(2,), contains=["X", "Y"])
+
+# explicit — use this when you also need per-label units
 ReadoutSpecs(
     "lockin_xy",
     DataKind.TRACE,
     shape=(2,),
-    contains=["X", "Y"],
-    trailing_dims=[{"name": "component", "values": ["X", "Y"]}],
+    trailing_dims=[{"name": "component", "values": ["X", "Y"], "units": ["V", "V"]}],
 )
 # → run.to_xarray("lockin_xy") has a "component" dim with ["X","Y"] coords
 # → run.values("lockin_xy", component="X") selects the X layer
@@ -467,13 +483,15 @@ ReadoutSpecs(
     "resonance",
     DataKind.IMAGE,
     shape=(3, 801),
-    contains=["fpts", "mag", "phase"],
     trailing_dims=[
-        {"name": "component", "values": ["fpts", "mag", "phase"]},
+        {"name": "component", "values": ["fpts", "mag", "phase"],
+         "units": ["Hz", "dBm", "deg"]},
         {"name": "freq", "unit": "Hz", "values": np.linspace(4e9, 8e9, 801)},
     ],
 )
 # → run.to_xarray("resonance") has dims (..., "component", "freq")
+# → run.to_xarray("resonance").attrs["component_units"]
+#   == {"fpts": "Hz", "mag": "dBm", "phase": "deg"}
 # → run.to_xarray("resonance", component="mag") drops the component dim
 ```
 
@@ -677,19 +695,20 @@ point   = run.read("S21_mag", (3, 100)) # scalar
 signal = run.values("S21_mag")          # shape (20, 1601), NaN at unwritten points
 ```
 
-#### Selecting a named component (IMAGE readouts)
+#### Selecting a named component
 
-When an IMAGE readout has `contains` as a list of layer names, use
-`component=` to extract one layer.  The layer dimension is removed from the
-result.
+When a readout has named layers (via `trailing_dims` with a component dimension, or via the `contains`-as-list shorthand), use `component=` to extract one layer by name.  The component dimension is removed from the result.
 
 ```python
-# resonance: shape (20, 1601, 3, 801), contains=['fpts','mag','phase']
+# resonance: shape (20, 1601, 3, 801), component labels ['fpts','mag','phase']
 run.read("resonance", component="mag")          # shape (20, 1601, 801)
 run.read("resonance", (5,), component="mag")    # shape (1601, 801)  — row 5
 run.values("resonance", component="mag")        # shape (20, 1601, 801), NaN at unwritten
 
-# passing component= to a SCALAR or TRACE readout raises VaultError
+# also works on TRACE with shape=(2,) and labels ["X","Y"]
+run.values("lockin_xy", component="X")          # shape == control_shape
+
+# passing component= when no component dim exists raises VaultError
 ```
 
 ### 8.5 xarray integration
@@ -740,9 +759,13 @@ da.plot.pcolormesh(cmap="RdBu_r")
 **IMAGE readouts with named components:**
 
 ```python
-# resonance: shape (20, 50, 3, 801), contains=['fpts','mag','phase']
+# resonance: shape (20, 50, 3, 801), component labels ['fpts','mag','phase']
 da_mag = run.to_xarray("resonance", component="mag")   # shape (20, 50, 801)
 da_mag.sel(Vch=0.0, method="nearest").plot()           # 2-D map: Vg vs freq
+
+# all components at once
+da = run.to_xarray("resonance")     # dims: (..., "component", "freq")
+da.attrs["component_units"]         # {"fpts": "Hz", "mag": "dBm", "phase": "deg"}
 ```
 
 **Multi-control axes** (two variables swept together on the same dimension):
@@ -1196,11 +1219,15 @@ AxisSpecs(controls: list[ControlVar])
 ReadoutSpecs(
     name: str,
     kind: DataKind,
-    unit: str | list[str] = None,
+    unit: str = None,                       # single unit string for the readout
     shape: tuple[int, ...] = None,          # required for TRACE and IMAGE
-    contains: str | list[str] = None,
-    trailing_dims: list[dict] = None,       # named trailing dimensions
-    # each dict: {"name": str, "unit": str, "values": array | list}
+    contains: str | list[str] = None,       # list auto-promotes to trailing_dims
+    trailing_dims: list[dict] = None,
+    # each dict keys:
+    #   "name":  str           — dimension name
+    #   "unit":  str           — unit for homogeneous axis
+    #   "units": list[str]     — per-label units for component dim
+    #   "values": list | array — coordinate values (numeric → zarr, string → yaml)
 )
 ```
 
@@ -1347,11 +1374,12 @@ vault.to_xarray(
     name,
     *,
     component=None,              # select one named layer (removes layer dim)
-    trailing_coords=None,        # {dim_name: array} — override / supply coords for old vaults
+    trailing_coords=None,        # {dim_name: array} — supply coords for old vaults
 ) → xr.DataArray
 
-# component= selects one named layer of an IMAGE readout whose contains is a list.
+# component= works for any readout with a "component" trailing_dim (or contains-as-list).
 # trailing_coords= is a fallback for vaults written without trailing_dims in ReadoutSpecs.
+# da.attrs["component_units"] is set when trailing_dims carries a "units" list.
 # to_xarray raises ImportError when xarray is not installed.
 ```
 

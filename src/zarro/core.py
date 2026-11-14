@@ -85,15 +85,25 @@ class AxisSpecs:
 class ReadoutSpecs:
     name: str
     kind: DataKind
-    unit: Optional[str | list[str]] = None
+    unit: Optional[str] = None
     shape: Optional[tuple[int, ...]] = None  # For trace/array data, specify the shape of the trailing dimensions (e.g. trace length or image height/width)
     contains: Optional[str | list[str]] = None
     trailing_dims: Optional[list[dict]] = None
     # trailing_dims: ordered list of dicts describing trailing dimensions, e.g.:
-    #   [{"name": "component", "values": ["mag", "phase"]},
+    #   [{"name": "component", "values": ["mag", "phase"], "units": ["Hz", "dBm"]},
     #    {"name": "freq", "unit": "Hz", "values": np.linspace(4e9, 8e9, 1601)}]
     # Numeric value arrays are stored in vault.zarr as "{readout_name}.{dim_name}".
     # String value arrays (e.g. component labels) go into metadata only.
+    # "units" (list) on a component dim gives per-label units; exposed in to_xarray attrs.
+
+
+def _keep_in_meta(k: str, v) -> bool:
+    """Return True if a trailing_dim key-value pair should be stored in metadata.yaml."""
+    if k != "values":
+        return True
+    if isinstance(v, (list, tuple)):
+        return bool(v) and isinstance(v[0], str)
+    return False  # numpy array → goes in zarr
 
 
 @dataclass(slots=True)
@@ -125,19 +135,18 @@ class MeasurementSchema:
         return [r.name for r in self.readout]
 
     def __post_init__(self):
+        # Auto-promote contains-as-list to trailing_dims when trailing_dims not set.
+        for r in self.readout:
+            if isinstance(r.contains, list) and r.trailing_dims is None:
+                r.trailing_dims = [{"name": "component", "values": r.contains}]
+
         readout_meta = {}
         for r in self.readout:
             specs = asdict(r)
             specs.pop("name")
             # Strip numeric arrays from trailing_dims — they go in zarr, not yaml.
-            # Keep string lists (e.g. component labels) in yaml.
+            # Keep string lists (e.g. component labels) and "units" lists in yaml.
             if specs.get("trailing_dims"):
-                def _keep_in_meta(k, v):
-                    if k != "values":
-                        return True
-                    if isinstance(v, (list, tuple)):
-                        return bool(v) and isinstance(v[0], str)
-                    return False  # numpy array → goes in zarr
                 specs["trailing_dims"] = [
                     {k: v for k, v in td.items() if _keep_in_meta(k, v)}
                     for td in specs["trailing_dims"]

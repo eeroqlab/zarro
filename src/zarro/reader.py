@@ -156,6 +156,8 @@ class Vault:
         self.axes: dict[str, Axis] = {}
         self.readouts: dict[str, Readout] = {}
         self.trailing_coords: dict[str, dict[str, np.ndarray]] = {}
+        self.trailing_units: dict[str, dict[str, list]] = {}
+        # {readout_name: {dim_name: ["Hz","dBm","deg"]}} — per-label units for component dims
 
         if self.kind == "sweep":
             self._load_axes(control)
@@ -212,6 +214,7 @@ class Vault:
             )
             # Load numeric trailing coord arrays stored as "{name}.{dim_name}"
             tc: dict[str, np.ndarray] = {}
+            tu: dict[str, list] = {}
             for td in td_specs:
                 if not isinstance(td, dict):
                     continue
@@ -222,8 +225,12 @@ class Vault:
                 elif isinstance(td.get("values"), list):
                     # string labels stored in metadata
                     tc[dim_name] = np.asarray(td["values"])
+                if isinstance(td.get("units"), list):
+                    tu[dim_name] = td["units"]
             if tc:
                 self.trailing_coords[name] = tc
+            if tu:
+                self.trailing_units[name] = tu
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -275,10 +282,15 @@ class Vault:
         r = self.readouts.get(name)
         contains = r.contains if r is not None else None
         if not isinstance(contains, list):
-            raise VaultError(
-                f"readout '{name}' has no named components "
-                f"(contains={contains!r}); component= is only valid when contains is a list"
-            )
+            # fall back to trailing_coords "component" labels (set via trailing_dims)
+            comp_labels = self.trailing_coords.get(name, {}).get("component")
+            if comp_labels is not None:
+                contains = list(comp_labels)
+            else:
+                raise VaultError(
+                    f"readout '{name}' has no named components "
+                    f"(contains={contains!r}); component= is only valid when contains is a list"
+                )
         if component not in contains:
             raise VaultError(
                 f"component '{component}' not found in '{name}'; "
@@ -490,6 +502,17 @@ class Vault:
         da.attrs["long_name"] = name
         if component is not None:
             da.attrs["component"] = component
+
+        # Attach per-label units for component dims (e.g. {"fpts":"Hz","mag":"dBm"})
+        ru = self.trailing_units.get(name, {})
+        for dim_name, unit_list in ru.items():
+            if component is not None and dim_name == "component":
+                continue  # component dim was removed from the array
+            tc_labels = self.trailing_coords.get(name, {}).get(dim_name)
+            if tc_labels is not None and len(unit_list) == len(tc_labels):
+                da.attrs[f"{dim_name}_units"] = {
+                    str(label): u for label, u in zip(tc_labels, unit_list)
+                }
 
         return da
 
