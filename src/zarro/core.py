@@ -182,18 +182,13 @@ class ExperimentID:
         return self.current_id() + 1   
 
     def next_dir(self):
-        name = str(self.next_id()).rjust(4, "0")
-        return self.root / Path(name)
-    
+        return self.get_dir_name(self.next_id())
+
     def current_dir(self):
-        name = str(self.current_id()).rjust(4, "0")
-        return self.root / Path(name)
-    
+        return self.get_dir_name(self.current_id())
+
     def get_dir_name(self, id: int | str):
-        if isinstance(id, str):
-            return self.root / Path(id)
-        else:
-            return self.root / Path(str(id).rjust(4, "0"))
+        return self.root / (id if isinstance(id, str) else f"{id:04d}")
 
 
 def compute_sharding(shape: tuple[int, ...], num_shards: int) -> tuple[int, ...]:
@@ -438,8 +433,6 @@ class ZarrWriter:
         if len(index) != len(self._control_shape) - num_slices:
             raise ValueError(f"index length {len(index)} does not match control dims {len(self._control_shape) - num_slices}")
 
-        datakind_by_name = {r.name: r.kind for r in self.schema.readout}
-
         # Write each dataset
         for name, value in data.items():
             if name not in self.vault:
@@ -448,20 +441,8 @@ class ZarrWriter:
             arr = self.vault[name]
             value = np.asarray(value, dtype=arr.dtype)
 
-            match datakind_by_name[name]:
-                case DataKind.SCALAR:
-                    self._check_input_shape(value, arr.shape[len(index):], name)  # FIX: re-enabled shape validation
-                    index_tuple = index + (slice(None),) * (num_slices + 0)
-
-                case DataKind.TRACE:
-                    self._check_input_shape(value, arr.shape[len(index):], name)  # FIX: re-enabled shape validation
-                    index_tuple = index + (slice(None),) * (num_slices + 1)
-
-                case DataKind.IMAGE:
-                    self._check_input_shape(value, arr.shape[len(index):], name)  # FIX: re-enabled shape validation
-                    index_tuple = index + (slice(None),) * (num_slices + 2)
-
-            arr[index_tuple] = value
+            self._check_input_shape(value, arr.shape[len(index):], name)
+            arr[index] = value
 
 
     def write_point(self, index: tuple[int, ...], data: dict[str, np.ndarray]):
@@ -486,8 +467,7 @@ class ZarrWriter:
             value = np.asarray(value, dtype=arr.dtype)
             self._check_input_shape(value, arr.shape, name)
 
-            index_tuple = (slice(None),) * len(arr.shape)
-            arr[index_tuple] = value
+            arr[...] = value
 
 
     def _check_input_shape(self, value: np.ndarray, expected_shape: tuple[int, ...], name: str):
@@ -576,15 +556,9 @@ class NpzWriter:
     overwrite: bool = False
     compressed: bool = False
 
-    # Not user controlled
-    _control_shape: tuple[int, ...] = field(init=False)
-
     def __post_init__(self):
         self.root = Path(self.root)
         self.root.mkdir(parents=True, exist_ok=True)
-
-        if self.schema is not None:
-            self._control_shape = tuple(ax.length for ax in self.schema.control)
 
 
     def write(self, data: dict[str, np.ndarray]):

@@ -18,12 +18,8 @@ Example
 >>> run = open_vault("data/0007")
 >>> run.axes, run.shape
 >>> signal = run.values("signal")           # NaN where not written yet
->>> x = run.coords[run.axes[0].controls[0]]
 """
 
-from __future__ import annotations
-
-import os
 from dataclasses import dataclass
 import re
 from pathlib import Path
@@ -97,18 +93,14 @@ def _infer_kind(trailing: tuple[int, ...]) -> str:
     return ("scalar", "trace", "image")[min(len(trailing), 2)]
 
 
-def _print_table(rows, headers, title, tabulate) -> None:
+def _print_table(rows, headers, title) -> None:
     print(title)
-    if tabulate is not None:
-        print(tabulate(rows, headers=headers, tablefmt="simple"))
-    else:
-        # minimal fallback when tabulate is not installed
-        col_widths = [max(len(str(h)), *(len(str(r[i])) for r in rows)) for i, h in enumerate(headers)]
-        fmt = "  ".join(f"{{:<{w}}}" for w in col_widths)
-        print(fmt.format(*headers))
-        print("  ".join("-" * w for w in col_widths))
-        for row in rows:
-            print(fmt.format(*row))
+    widths = [max(len(str(h)), *(len(str(r[i])) for r in rows)) for i, h in enumerate(headers)]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    print(fmt.format(*headers))
+    print("  ".join("-" * w for w in widths))
+    for row in rows:
+        print(fmt.format(*row))
 
 
 class Vault:
@@ -367,26 +359,9 @@ class Vault:
 
     @staticmethod
     def _stored_chunks(root: Path, ndim: int) -> list[tuple[int, ...]]:
-        """Chunk indices present on disk, found by listing the directory tree once."""
-        found: list[tuple[int, ...]] = []
-
-        def walk(directory: str, prefix: tuple[int, ...]) -> None:
-            try:
-                entries = list(os.scandir(directory))
-            except OSError:
-                return
-            for entry in entries:
-                if not entry.name.isdigit():
-                    continue
-                idx = prefix + (int(entry.name),)
-                if len(idx) == ndim:
-                    if entry.is_file():
-                        found.append(idx)
-                elif entry.is_dir():
-                    walk(entry.path, idx)
-
-        walk(str(root), ())
-        return found
+        """Chunk indices present on disk."""
+        parts = (p.relative_to(root).parts for p in root.rglob("*") if p.is_file())
+        return [tuple(map(int, q)) for q in parts if len(q) == ndim and all(x.isdigit() for x in q)]
 
     def to_xarray(self, name: str, *, component: str | None = None,
                   trailing_coords: dict | None = None):
@@ -431,10 +406,9 @@ class Vault:
         rd = self.readouts.get(name)
 
         # ── grid dims ────────────────────────────────────────────────────
-        from collections import defaultdict
-        dim_axes: dict[int, list] = defaultdict(list)
+        dim_axes: dict[int, list] = {}
         for ax in self.axes.values():
-            dim_axes[ax.dim].append(ax)
+            dim_axes.setdefault(ax.dim, []).append(ax)
 
         n_grid = len(dim_axes)
         dims: list[str] = []
@@ -518,11 +492,6 @@ class Vault:
 
     def snapshot(self) -> None:
         """Print a human-readable summary of the vault."""
-        try:
-            from tabulate import tabulate
-        except ImportError:
-            tabulate = None
-
         shape_str = "x".join(map(str, self.shape))
         date = self.metadata.get("date", "—")
         tags_str = ", ".join(self.tags) if self.tags else "—"
@@ -546,7 +515,6 @@ class Vault:
                 axis_rows,
                 headers=["role", "variable", "length", "unit"],
                 title="Control axes",
-                tabulate=tabulate,
             )
         else:
             n = self.shape[0]
@@ -567,7 +535,6 @@ class Vault:
             readout_rows,
             headers=["name", "kind", "shape", "unit", "contains"],
             title="Readouts",
-            tabulate=tabulate,
         )
 
     def __repr__(self) -> str:

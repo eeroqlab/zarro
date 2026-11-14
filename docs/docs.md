@@ -642,8 +642,7 @@ For a **monitor** run the control-axes block is replaced by `Time axis: N sample
 For a **multi-control axis** (two variables sharing one axis), each variable
 appears on its own row under the same `axis0` label.
 
-`snapshot` requires [tabulate](https://pypi.org/project/tabulate/) and falls
-back to a plain-text table when it is not installed.
+`snapshot` prints plain-text tables and has no extra dependencies.
 
 ### 8.2 Control axes and coordinates
 
