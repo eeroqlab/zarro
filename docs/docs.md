@@ -618,29 +618,29 @@ run.snapshot()
 Example output for a 2D sweep:
 
 ```
-Kind:  sweep       Shape: 20x1601 (step sweep)   Date: 2026-11-12T14:03:21
+Kind:  2D step sweep       Shape: 20x1601       Date: 2026-11-12T14:03:21
 Tags:  vna, 2K
 Path:  ./data/run_001
 
 Control axes
-axis    role    variable      length  unit
-------  ------  ----------  --------  ------
-axis0   step    power             20  dBm
-axis1   sweep   freq            1601  Hz
+role   variable  length  unit
+-----  --------  ------  ----
+step   power     20      dBm
+sweep  freq      1601    Hz
 
 Readouts
-name      kind    shape     unit    contains
---------  ------  --------  ------  ----------
-S21_mag   scalar  ()        dBm     —
-S21       trace   (1601,)   V       S21
+name     kind    shape    unit  contains
+-------  ------  -------  ----  --------
+S21_mag  scalar  ()       dBm   —
+S21      trace   (1601,)  V     S21
 ```
 
-Dimension roles — `sweep` (innermost / fastest), `step`, `frame`, `volume` (slowest) — appear in the shape header and in the axis table's role column.  A 3D sweep would read `frame step sweep`.
+Dimension roles — `sweep` (innermost / fastest), `step`, `frame`, `volume` (slowest) — appear in the header (the outermost role, e.g. `2D step sweep`) and in the axis table's role column.  A 3D sweep reads `3D frame sweep`.
 
 For a **monitor** run the control-axes block is replaced by `Time axis: N samples`.
 
 For a **multi-control axis** (two variables sharing one axis), each variable
-appears on its own row under the same `axis0` label.
+appears on its own row with the same role.
 
 `snapshot` prints plain-text tables and has no extra dependencies.
 

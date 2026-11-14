@@ -3,6 +3,7 @@ CHANGES
 
 [2026-11-14]
 - reader: snapshot() no longer uses tabulate; always prints its built-in plain-text tables
+  (docs §8.1 example output updated to match the new format)
 - core/reader: simplified (ExperimentID dir naming, _write/write_all indexing, _stored_chunks via rglob,
   removed NpzWriter._control_shape and unused imports)
 - core: ReadoutSpecs.unit is now str only; list[str] removed (per-component units
