@@ -287,7 +287,7 @@ schema = MeasurementSchema(
     writetype=WriteType.POINTWISE,
 )
 
-print(schema.axis_names)    # {'axis0': ['power'], 'axis1': ['freq']}
+print(schema.axis_names)    # {'axis0': {'power': {'unit': 'dBm'}}, 'axis1': {'freq': {'unit': 'Hz'}}}
 print(schema.readout_names) # ['S21_mag', 'S21_phase', 'S21_trace']
 print(schema.meta)          # full metadata dict used in file headers
 ```
@@ -348,17 +348,18 @@ Use when the inner axis is always swept as a unit (e.g. a VNA returns a full tra
 # schema.writetype = WriteType.TRACEWISE
 # control_shape = (N_power, N_freq)
 # index length = len(control_shape) - 1 = 1
+# each write fills one full row along the inner (freq) axis
 
 schema = MeasurementSchema(
     control=[AxisSpecs([power]), AxisSpecs([freq])],
-    readout=[ReadoutSpecs("S21", DataKind.TRACE, shape=(1601,))],
+    readout=[ReadoutSpecs("S21", DataKind.SCALAR)],
     writetype=WriteType.TRACEWISE,
 )
 writer = ZarrWriter(root="./data/run_002", schema=schema,
                     overwrite=True, initialize_arrays=True)
 
 for i in range(N_power):
-    trace = vna.sweep()              # shape (1601,)
+    trace = vna.sweep()              # shape (N_freq,) = (1601,)
     writer.write_trace(
         index=(i,),
         data={"S21": trace},
@@ -858,10 +859,14 @@ print(run.shape)   # (n_samples,) — grows while the run is live
 print(run.time)    # unix timestamps, shape (n_samples,)
 
 x_values = run.values("x")   # shape (n_samples,), always fully written
+
+da = run.to_xarray("x")      # dims ("time",); trace/image readouts add "sample" / "row","col"
+da.coords["time"]            # raw Unix seconds, attrs["units"] == "s (unix epoch)"
+da.sel(time=t0, method="nearest")
 ```
 
 The vault can be opened before the writer calls `close()`.
-The readout shapes are inferred automatically from the array dimensions.
+The readouts and their shapes come from the vault's manifest ([§6.4](#64-vault-manifest)); for older vaults they are inferred from the array dimensions.
 
 ### 8.8 Fallback when metadata is missing
 
@@ -869,6 +874,8 @@ Vaults written by this version carry their own manifest ([§6.4](#64-vault-manif
 structure explicitly:
 
 ```python
+from zarro import Vault
+
 run = Vault(
     "./data/run_001",
     control={"axis0": {"freq": {"unit": "Hz"}}, "axis1": {"power": {"unit": "dBm"}}},
@@ -896,22 +903,22 @@ all_mag = z["S21_mag"][:]     # shape (20, 1601)
 ```python
 from zarro import ExperimentID
 
-eid = ExperimentID(root="./data")
+eid = ExperimentID(root="./experiments")
 
 print(eid.current_id())   # e.g. 3
 print(eid.next_id())      # 4
-print(eid.next_dir())     # PosixPath('./data/0004')
-print(eid.current_dir())  # PosixPath('./data/0003')
+print(eid.next_dir())     # PosixPath('./experiments/0004')
+print(eid.current_dir())  # PosixPath('./experiments/0003')
 
 # Look up an existing folder by integer ID or string name
-print(eid.get_dir_name(2))            # PosixPath('./data/0002')
-print(eid.get_dir_name("special_run")) # PosixPath('./data/special_run')
+print(eid.get_dir_name(2))            # PosixPath('./experiments/0002')
+print(eid.get_dir_name("special_run")) # PosixPath('./experiments/special_run')
 ```
 
 Typical usage in a measurement script:
 
 ```python
-eid = ExperimentID(root="./data")
+eid = ExperimentID(root="./experiments")
 run_dir = eid.next_dir()
 
 writer = ZarrWriter(root=run_dir, schema=schema,
@@ -1262,7 +1269,7 @@ MeasurementSchema(
     readout: list[ReadoutSpecs],
     writetype: WriteType = WriteType.POINTWISE,
 )
-# Property: .axis_names    → dict[str, list[str]]
+# Property: .axis_names    → dict[str, dict[str, dict]]  e.g. {'axis0': {'power': {'unit': 'dBm'}}}
 # Property: .readout_names → list[str]
 # Property: .meta          → dict  (auto-generated)
 ```
@@ -1403,6 +1410,7 @@ vault.to_xarray(
 # component= works for any readout with a "component" trailing_dim (or contains-as-list).
 # trailing_coords= is a fallback for vaults written without trailing_dims in ReadoutSpecs.
 # da.attrs["component_units"] is set when trailing_dims carries a "units" list.
+# Monitor runs get a leading "time" dim (coord = raw Unix seconds).
 # to_xarray raises ImportError when xarray is not installed.
 ```
 

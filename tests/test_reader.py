@@ -1329,3 +1329,46 @@ class TestManifest:
         sw.close(meta={"sensor": "A"})
         attrs = self._zarr_attrs(tmp_path)
         assert "zarro" in attrs and attrs["sensor"] == "A"
+
+
+# ===========================================================================
+# TestToXarrayMonitor — time dimension for monitor vaults
+# ===========================================================================
+
+class TestToXarrayMonitor:
+
+    def _vault(self, tmp_path, n=3):
+        sw = StreamingWriter(root=tmp_path, readouts={"x": (), "sig": (N_T,), "frame": (N_H, N_W)}, chunk_size=2)
+        for i in range(n):
+            sw.append({"x": float(i), "sig": np.full(N_T, i), "frame": np.full((N_H, N_W), i)},
+                      timestamp=1000.0 + i)
+        sw.close()
+        return Vault(tmp_path)
+
+    def test_scalar_dims_and_coord(self, tmp_path):
+        v = self._vault(tmp_path)
+        da = v.to_xarray("x")
+        assert da.dims == ("time",)
+        np.testing.assert_array_equal(da.coords["time"].values, [1000.0, 1001.0, 1002.0])
+        np.testing.assert_array_equal(da.values, [0.0, 1.0, 2.0])
+
+    def test_trace_and_image_dims(self, tmp_path):
+        v = self._vault(tmp_path)
+        assert v.to_xarray("sig").dims == ("time", "sample")
+        assert v.to_xarray("frame").dims == ("time", "row", "col")
+        assert v.to_xarray("frame").shape == (3, N_H, N_W)
+
+    def test_time_coord_units(self, tmp_path):
+        v = self._vault(tmp_path)
+        assert v.to_xarray("x").coords["time"].attrs["units"] == "s (unix epoch)"
+
+    def test_sel_by_time(self, tmp_path):
+        v = self._vault(tmp_path)
+        assert float(v.to_xarray("x").sel(time=1001.2, method="nearest")) == 1.0
+
+    def test_opened_before_close(self, tmp_path):
+        sw = StreamingWriter(root=tmp_path, readouts={"x": ()}, chunk_size=4)
+        sw.append({"x": 1.0}, timestamp=5.0)
+        sw.flush()
+        da = Vault(tmp_path).to_xarray("x")
+        assert da.dims == ("time",) and da.shape == (1,)

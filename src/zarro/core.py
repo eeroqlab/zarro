@@ -48,11 +48,8 @@ class ControlVar:
         return len(self.values)
     
     def __post_init__(self):
-        if self.reverse:
-            extended_values = np.zeros(2 * self.length)
-            extended_values[:self.length] = self.values
-            extended_values[self.length:] = self.values[::-1]
-            self.values = extended_values
+        if self.reverse:  # frozen dataclass: assign via object.__setattr__
+            object.__setattr__(self, "values", np.concatenate([self.values, self.values[::-1]]))
 
 
 @dataclass(slots=True)

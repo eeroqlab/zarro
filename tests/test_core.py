@@ -88,6 +88,22 @@ class TestControlVar:
         assert v.unit == "V"
         assert v.instrument == "DAC"
 
+    def test_reverse_doubles_values_forward_then_backward(self):
+        v = ControlVar("Vb", np.array([0.0, 1.0, 2.0]), reverse=True)
+        np.testing.assert_array_equal(v.values, [0, 1, 2, 2, 1, 0])
+        assert v.length == 6
+
+    def test_reverse_axis_length_and_writer_roundtrip(self, tmp_path):
+        v = ControlVar("Vb", np.linspace(0, 1, 4, dtype=np.float32), reverse=True)
+        schema = MeasurementSchema(
+            control=[AxisSpecs([v])],
+            readout=[ReadoutSpecs("x", DataKind.SCALAR)],
+        )
+        assert schema.control[0].length == 8
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        z = zarr.open_group(str(tmp_path / "vault.zarr"), mode="r")
+        np.testing.assert_array_almost_equal(z["Vb"][:], v.values)
+
 
 # ===========================================================================
 # AxisSpecs

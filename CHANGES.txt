@@ -2,6 +2,16 @@ CHANGES
 =======
 
 [2026-11-14]
+- reader: to_xarray() on monitor runs now has a leading "time" dimension whose coordinate is
+  the raw Unix timestamps (attrs["units"] = "s (unix epoch)"); grid logic factored into
+  Vault._grid_dims_and_coords()
+- core: fix ControlVar(reverse=True) raising FrozenInstanceError (values were assigned on a
+  frozen dataclass); values are now forward then backward as documented. Added tests.
+- docs: every python example in docs.md §1-§13 was executed against stub hardware and
+  purpose-built vaults; fixed: §4.3 tracewise example (used a TRACE readout with a per-row
+  write of the wrong shape; now SCALAR), §3.4/§14 axis_names output, §8.8 missing Vault
+  import, §9 now uses ./experiments (a numeric-only folder scan breaks on ./data/run_001),
+  §8.7 monitor to_xarray + manifest wording
 - core: writers store a normalized manifest in vault.zarr attributes under "zarro"
   ({version, kind, axes[{name,dim,unit}], readouts[{name,kind,shape,unit,contains,trailing_dims}]})
   * ZarrWriter writes it at init (and in write_metadata); StreamingWriter at init

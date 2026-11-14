@@ -380,11 +380,28 @@ class Vault:
         parts = (p.relative_to(root).parts for p in root.rglob("*") if p.is_file())
         return [tuple(map(int, q)) for q in parts if len(q) == ndim and all(x.isdigit() for x in q)]
 
+    def _grid_dims_and_coords(self) -> tuple[list[str], dict]:
+        """Names and coordinates of the leading (grid or time) dimensions."""
+        if self.kind == "monitor":
+            return ["time"], {"time": ("time", self.time)}
+        dim_axes: dict[int, list] = {}
+        for ax in self.axes.values():
+            dim_axes.setdefault(ax.dim, []).append(ax)
+        dims, coords = [], {}
+        for d in sorted(dim_axes):
+            on_dim = dim_axes[d]
+            dim_name = on_dim[0].name if len(on_dim) == 1 else f"dim{d}"
+            dims.append(dim_name)
+            coords.update({ax.name: (dim_name, ax.values) for ax in on_dim})
+        return dims, coords
+
     def to_xarray(self, name: str, *, component: str | None = None,
                   trailing_coords: dict | None = None):
         """Return a readout as an :class:`xarray.DataArray` with labeled axes.
 
         Coordinate arrays from :attr:`axes` are attached as named coordinates.
+        Monitor runs get a leading ``"time"`` dimension whose coordinate is the
+        raw Unix timestamps (seconds).
         NaN is used for unwritten grid points (same as :meth:`values`).
         Units, when present, are stored in ``.attrs["units"]``.
 
@@ -422,20 +439,8 @@ class Vault:
         data = self.values(name, component=component)
         rd = self.readouts.get(name)
 
-        # ── grid dims ────────────────────────────────────────────────────
-        dim_axes: dict[int, list] = {}
-        for ax in self.axes.values():
-            dim_axes.setdefault(ax.dim, []).append(ax)
-
-        n_grid = len(dim_axes)
-        dims: list[str] = []
-        coords: dict = {}
-        for d in sorted(dim_axes):
-            axes_on_dim = dim_axes[d]
-            dim_name = axes_on_dim[0].name if len(axes_on_dim) == 1 else f"dim{d}"
-            dims.append(dim_name)
-            for ax in axes_on_dim:
-                coords[ax.name] = (dim_name, ax.values)
+        dims, coords = self._grid_dims_and_coords()
+        n_grid = len(dims)
 
         # ── trailing dims ─────────────────────────────────────────────────
         n_trailing = data.ndim - n_grid
@@ -488,6 +493,8 @@ class Vault:
         for ax in self.axes.values():
             if ax.unit and ax.name in da.coords:
                 da.coords[ax.name].attrs["units"] = ax.unit
+        if self.kind == "monitor":
+            da.coords["time"].attrs["units"] = "s (unix epoch)"
         if rd is not None and rd.unit:
             da.attrs["units"] = rd.unit
         da.attrs["long_name"] = name
