@@ -30,6 +30,7 @@ A comprehensive guide to the `zarro` package for structured experimental data sa
    - [write_metadata](#61-write_metadata)
    - [write_yaml](#62-write_yaml)
    - [Tags](#63-tags)
+   - [Vault manifest](#64-vault-manifest)
 7. [Adding Arrays After Initialization](#7-adding-arrays-after-initialization)
 8. [Reading Data](#8-reading-data)
    - [Quick overview with snapshot](#81-quick-overview-with-snapshot)
@@ -556,6 +557,29 @@ writer.tags.append("temperature_sweep")
 writer.write_metadata()
 ```
 
+### 6.4 Vault manifest
+
+Besides the metadata above, every writer stores a small **manifest** in the vault's group attributes (`vault.zarr/zarr.json` → `attributes["zarro"]`). It is the one place `open_vault` reads the run's structure from, so it needs no format guessing.
+
+- `ZarrWriter` writes it at initialization (and again in `write_metadata()`), so a run can be opened mid-sweep even before `metadata.yaml` or the final attributes exist.
+- `StreamingWriter` writes it at init.
+- `write_metadata()` / `close()` / `dump()` merge into the attributes, so the manifest is never overwritten.
+
+```json
+"zarro": {
+  "version": 2,
+  "kind": "sweep",
+  "axes": [{"name": "power", "dim": 0, "unit": "dBm"},
+           {"name": "freq",  "dim": 1, "unit": "Hz"}],
+  "readouts": [
+    {"name": "S21", "kind": "trace", "shape": [1601], "unit": "dBm", "contains": null,
+     "trailing_dims": [{"name": "freq", "unit": "Hz"}]}
+  ]
+}
+```
+
+Coordinate and data values are not duplicated here: they stay in their own arrays (`power`, `freq`, `S21.freq`, …). Only string labels (component names) and per-label `units` live in the manifest. `vault.metadata` does not include the manifest.
+
 ---
 
 ## 7. Adding Arrays After Initialization
@@ -841,7 +865,7 @@ The readout shapes are inferred automatically from the array dimensions.
 
 ### 8.8 Fallback when metadata is missing
 
-If `metadata.yaml` is gone and zarr attributes were never written, pass the
+Vaults written by this version carry their own manifest ([§6.4](#64-vault-manifest)) and open without any of this.  For **older vaults** (no manifest) whose `metadata.yaml` is gone and whose zarr attributes were never written, pass the
 structure explicitly:
 
 ```python

@@ -2,6 +2,19 @@ CHANGES
 =======
 
 [2026-11-14]
+- core: writers store a normalized manifest in vault.zarr attributes under "zarro"
+  ({version, kind, axes[{name,dim,unit}], readouts[{name,kind,shape,unit,contains,trailing_dims}]})
+  * ZarrWriter writes it at init (and in write_metadata); StreamingWriter at init
+  * MeasurementSchema.manifest property builds it
+  * write_metadata/close/dump now merge into zarr attrs (attrs.update) instead of
+    replacing them, so the manifest is preserved
+  * existing data layout, metadata.yaml and attrs content are unchanged
+- reader: Vault reads structure from the manifest; _load_axes/_load_readouts replaced by
+  _build_axes/_build_readouts, and all old-format handling moved into _legacy_manifest()
+  (used only for vaults without a manifest; control=/readouts= fallbacks still apply there)
+  * a run can now be opened mid-sweep without metadata.yaml
+  * "zarro" key is hidden from Vault.metadata
+- docs: new §6.4 Vault manifest; §8.8 clarifies the fallback is for older vaults
 - reader: snapshot() no longer uses tabulate; always prints its built-in plain-text tables
   (docs §8.1 example output updated to match the new format)
 - core/reader: simplified (ExperimentID dir naming, _write/write_all indexing, _stored_chunks via rglob,

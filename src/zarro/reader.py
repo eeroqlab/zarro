@@ -103,6 +103,49 @@ def _print_table(rows, headers, title) -> None:
         print(fmt.format(*row))
 
 
+def _legacy_manifest(group, metadata: dict, kind: str, control: dict | None, readouts: dict | None) -> dict:
+    """Build a manifest for vaults written before ``attrs["zarro"]`` existed.
+
+    All old-format handling lives here: list- and dict-style control metadata,
+    the ``metadata["schema"]`` nesting, the ``control=``/``readouts=`` fallbacks
+    and shape/kind inference from the arrays themselves.
+    """
+    schema = metadata.get("schema") if isinstance(metadata.get("schema"), dict) else {}
+
+    axes = []
+    if kind == "sweep":
+        control = metadata.get("control") or schema.get("control") or control
+        if not control:
+            raise VaultError("no control axes in metadata.yaml, the zarr attributes or the arguments")
+        for key in sorted(control, key=lambda k: int(str(k).removeprefix("axis"))):
+            dim = int(str(key).removeprefix("axis"))
+            value = control[key]   # old: ["Vch", "Vm"]; new: {"Vch": {"unit": "V"}, ...}
+            for name in value:
+                unit = None if isinstance(value, list) else (value[name] or {}).get("unit")
+                axes.append({"name": name, "dim": dim, "unit": unit})
+
+    specs = metadata.get("readout") or schema.get("readout") or readouts
+    if not specs:
+        taken = {a["name"] for a in axes} | {"_time"}
+        specs = {n: {} for n in (list(metadata.get("readouts") or []) or
+                                 [n for n in group.array_keys() if n not in taken and "." not in n])}
+    lead = len({a["dim"] for a in axes}) if kind == "sweep" else 1
+    out = []
+    for name, spec in specs.items():
+        if name not in group:
+            continue
+        shape = tuple(group[name].shape[lead:])
+        out.append({
+            "name": name,
+            "kind": spec.get("kind") or _infer_kind(shape),
+            "shape": list(shape),
+            "unit": spec.get("unit"),
+            "contains": spec.get("contains"),
+            "trailing_dims": spec.get("trailing_dims") or [],
+        })
+    return {"version": 1, "kind": kind, "axes": axes, "readouts": out}
+
+
 class Vault:
     """A run directory opened for reading.
 
@@ -124,6 +167,8 @@ class Vault:
         A vault with a ``_time`` array is a monitor (StreamingWriter) run.
     metadata : metadata.yaml merged over the zarr attributes. The attributes are
         written when the writer finishes; metadata.yaml exists from the start.
+        The structure itself (axes, readouts) comes from the ``attrs["zarro"]`` manifest
+        written at init, or from :func:`_legacy_manifest` for older vaults.
     tags : list of str
     axes : ``dict[str, Axis]`` keyed by variable name (empty for monitors).
         ``run.axes["Vch"].values``, ``.unit``, ``.length``, ``.dim``.
@@ -141,7 +186,9 @@ class Vault:
         except Exception as exc:
             raise VaultError(f"cannot open {vault}: {exc}") from exc
 
-        self.metadata = {**dict(self._group.attrs), **load_yaml(self.path / "metadata.yaml")}
+        attrs = dict(self._group.attrs)
+        manifest = attrs.pop("zarro", None)
+        self.metadata = {**attrs, **load_yaml(self.path / "metadata.yaml")}
         self.tags = list(self.metadata.get("tags") or [])
         self.kind = "monitor" if "_time" in self._group else "sweep"
 
@@ -151,78 +198,48 @@ class Vault:
         self.trailing_units: dict[str, dict[str, list]] = {}
         # {readout_name: {dim_name: ["Hz","dBm","deg"]}} — per-label units for component dims
 
-        if self.kind == "sweep":
-            self._load_axes(control)
-        self._load_readouts(readouts)
+        if manifest is None:
+            try:
+                manifest = _legacy_manifest(self._group, self.metadata, self.kind, control, readouts)
+            except VaultError as exc:
+                raise VaultError(f"{self.path}: {exc}") from None
+        self._build_axes(manifest["axes"])
+        self._build_readouts(manifest["readouts"])
 
     # ── structure ─────────────────────────────────────────────────────
 
-    def _load_axes(self, fallback: dict | None) -> None:
-        schema = self.metadata.get("schema")
-        control = self.metadata.get("control") or (schema.get("control") if isinstance(schema, dict) else None)
-        control = control or fallback
-        if not control:
-            raise VaultError(f"{self.path}: no control axes in metadata.yaml, the zarr attributes or the arguments")
-        for key in sorted(control, key=lambda k: int(str(k).removeprefix("axis"))):
-            dim = int(str(key).removeprefix("axis"))
-            value = control[key]
-            if isinstance(value, list):          # old format: ["Vch", "Vm"]
-                names = tuple(value)
-                units = {n: None for n in names}
-            else:                                # new format: {"Vch": {"unit": "V"}, ...}
-                names = tuple(value.keys())
-                units = {n: (value[n] or {}).get("unit") for n in names}
-            missing = [n for n in names if n not in self._group]
-            if missing:
-                raise VaultError(f"{self.path}: coordinate array(s) {missing} not found in vault.zarr")
-            for n in names:
-                arr = np.asarray(self._group[n][:])
-                self.axes[n] = Axis(name=n, values=arr, unit=units[n], length=len(arr), dim=dim)
+    def _build_axes(self, axes: list[dict]) -> None:
+        missing = [a["name"] for a in axes if a["name"] not in self._group]
+        if missing:
+            raise VaultError(f"{self.path}: coordinate array(s) {missing} not found in vault.zarr")
+        for a in axes:
+            values = np.asarray(self._group[a["name"]][:])
+            self.axes[a["name"]] = Axis(
+                name=a["name"], values=values, unit=a.get("unit"), length=len(values), dim=a["dim"]
+            )
 
-    def _load_readouts(self, fallback: dict | None) -> None:
-        schema = self.metadata.get("schema")
-        specs = self.metadata.get("readout") or (schema.get("readout") if isinstance(schema, dict) else None)
-        specs = specs or fallback
-        if not specs:
-            names = list(self.metadata.get("readouts") or []) or [
-                n for n in self._group.array_keys()
-                if n != "_time" and n not in self.axes and "." not in n
-            ]
-            specs = {n: {} for n in names}
-        lead = len(self.shape) if self.kind == "sweep" else 1
-        for name, spec in specs.items():
+    def _build_readouts(self, readouts: list[dict]) -> None:
+        for r in readouts:
+            name = r["name"]
             if name not in self._group:
                 continue
-            trailing = tuple(self._group[name].shape[lead:])
-            td_specs = spec.get("trailing_dims") or []
-            td_names = tuple(td["name"] for td in td_specs if isinstance(td, dict))
+            dims = [td for td in r.get("trailing_dims") or [] if isinstance(td, dict)]
             self.readouts[name] = Readout(
                 name=name,
-                kind=spec.get("kind") or _infer_kind(trailing),
-                shape=trailing,
-                unit=spec.get("unit"),
-                contains=spec.get("contains"),
-                trailing_dims=td_names,
+                kind=r["kind"],
+                shape=tuple(r["shape"]),
+                unit=r.get("unit"),
+                contains=r.get("contains"),
+                trailing_dims=tuple(td["name"] for td in dims),
             )
-            # Load numeric trailing coord arrays stored as "{name}.{dim_name}"
-            tc: dict[str, np.ndarray] = {}
-            tu: dict[str, list] = {}
-            for td in td_specs:
-                if not isinstance(td, dict):
-                    continue
-                dim_name = td["name"]
-                zarr_key = f"{name}.{dim_name}"
-                if zarr_key in self._group:
-                    tc[dim_name] = np.asarray(self._group[zarr_key][:])
-                elif isinstance(td.get("values"), list):
-                    # string labels stored in metadata
-                    tc[dim_name] = np.asarray(td["values"])
+            for td in dims:
+                dim = td["name"]
+                if f"{name}.{dim}" in self._group:     # numeric coords live in their own array
+                    self.trailing_coords.setdefault(name, {})[dim] = np.asarray(self._group[f"{name}.{dim}"][:])
+                elif isinstance(td.get("values"), list):   # string labels live in the manifest
+                    self.trailing_coords.setdefault(name, {})[dim] = np.asarray(td["values"])
                 if isinstance(td.get("units"), list):
-                    tu[dim_name] = td["units"]
-            if tc:
-                self.trailing_coords[name] = tc
-            if tu:
-                self.trailing_units[name] = tu
+                    self.trailing_units.setdefault(name, {})[dim] = td["units"]
 
     @property
     def shape(self) -> tuple[int, ...]:

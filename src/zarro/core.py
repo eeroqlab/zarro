@@ -134,6 +134,26 @@ class MeasurementSchema:
     def readout_names(self) -> list[str]:
         return [r.name for r in self.readout]
 
+    @property
+    def manifest(self) -> dict:
+        """Normalized structure stored in the vault so the reader needs no format guessing."""
+        axes = [
+            {"name": c.name, "dim": d, "unit": c.unit}
+            for d, ax in enumerate(self.control) for c in ax.controls
+        ]
+        readouts = [
+            {
+                "name": r.name,
+                "kind": str(r.kind),
+                "shape": list(r.shape or ()),
+                "unit": r.unit,
+                "contains": r.contains,
+                "trailing_dims": self.meta["readout"][r.name].get("trailing_dims") or [],
+            }
+            for r in self.readout
+        ]
+        return {"version": 2, "kind": "sweep", "axes": axes, "readouts": readouts}
+
     def __post_init__(self):
         # Auto-promote contains-as-list to trailing_dims when trailing_dims not set.
         for r in self.readout:
@@ -272,6 +292,7 @@ class ZarrWriter:
             # Create/open arrays
             self._init_coord_arrays()
             self._init_data_arrays()
+            self.vault.attrs["zarro"] = serialize(self.schema.manifest)
             # Write a small manifest (you can expand with full experiment metadata)
             self.write_yaml()
 
@@ -516,8 +537,10 @@ class ZarrWriter:
         }
         if meta:
             metadata |= meta  # Merge additional metadata if provided
+        if self.schema is not None:
+            metadata["zarro"] = self.schema.manifest  # also covers initialize_arrays=False
         metadata = serialize(metadata)
-        self.vault.attrs.put(metadata)  # Store metadata as a single JSON string in Zarr attributes; can be parsed back into structured form when reading
+        self.vault.attrs.update(metadata)  # update, not put: keeps the attrs["zarro"] manifest
         self.write_yaml(meta)  # Also write a human-readable YAML manifest
 
 
@@ -539,7 +562,7 @@ class ZarrWriter:
 
 
     def dump(self, data: dict, meta: dict = None):
-        self.vault.attrs.put(meta if meta else {})  # Store per-array metadata in a separate attribute; can be accessed when reading to understand the structure of the data
+        self.vault.attrs.update(meta or {})
         for key, value in data.items():
             self.add_array(name=key, value=value)
 
@@ -645,6 +668,17 @@ class StreamingWriter:
                 overwrite=self.overwrite,
             )
 
+        self.vault.attrs["zarro"] = {
+            "version": 2,
+            "kind": "monitor",
+            "axes": [],
+            "readouts": [
+                {"name": name, "kind": ("scalar", "trace", "image")[min(len(trailing), 2)],
+                 "shape": list(trailing), "unit": None, "contains": None, "trailing_dims": []}
+                for name, trailing in self.readouts.items()
+            ],
+        }
+
     def append(self, data: dict, timestamp: float = None):
         """Buffer one sample. Flushes to disk automatically when chunk_size is reached.
 
@@ -701,5 +735,5 @@ class StreamingWriter:
         if meta:
             metadata |= meta
         metadata = serialize(metadata)
-        self.vault.attrs.put(metadata)
+        self.vault.attrs.update(metadata)
         (self.root / "metadata.yaml").write_text(yaml.safe_dump(metadata, sort_keys=False))

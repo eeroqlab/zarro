@@ -75,6 +75,13 @@ def write_all_2d(writer, scalar_data, trace_data):
             })
 
 
+def strip_manifest(path):
+    """Remove attrs['zarro'] so the vault looks like one written by an older zarro."""
+    import zarr as _zarr
+    g = _zarr.open_group(str(path / "vault.zarr"), mode="r+")
+    g.attrs.pop("zarro", None)
+
+
 def finished_vault(tmp_path):
     """Full 2D sweep, all points written, metadata written."""
     schema = make_2d_schema()
@@ -770,6 +777,7 @@ class TestFallbacks:
         schema = make_2d_schema()
         # initialize_arrays=True writes yaml; do NOT call write_metadata (no zarr attrs)
         ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        strip_manifest(tmp_path)
         # Corrupt the yaml
         (tmp_path / "metadata.yaml").write_text("[unclosed list")
 
@@ -791,6 +799,7 @@ class TestFallbacks:
         """Sweep vault with no readable metadata and no fallback raises VaultError."""
         schema = make_2d_schema()
         ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        strip_manifest(tmp_path)
         (tmp_path / "metadata.yaml").write_text("[unclosed list")
         with pytest.raises(VaultError):
             Vault(tmp_path)
@@ -1246,3 +1255,77 @@ class TestSnapshot:
         out = capsys.readouterr().out
         assert "monitor" in out
         assert "sample" in out
+
+
+# ===========================================================================
+# TestManifest — attrs["zarro"] written at init and preferred by the reader
+# ===========================================================================
+
+class TestManifest:
+
+    def _zarr_attrs(self, path):
+        import zarr as _zarr
+        return dict(_zarr.open_group(str(path / "vault.zarr"), mode="r").attrs)
+
+    def test_written_at_init_before_write_metadata(self, tmp_path):
+        ZarrWriter(root=tmp_path, schema=make_2d_schema(), overwrite=True, initialize_arrays=True)
+        m = self._zarr_attrs(tmp_path)["zarro"]
+        assert m["version"] == 2 and m["kind"] == "sweep"
+        assert [(a["name"], a["dim"], a["unit"]) for a in m["axes"]] == [("a", 0, "V"), ("b", 1, "Hz")]
+        assert [r["name"] for r in m["readouts"]] == ["scalar", "trace"]
+        assert m["readouts"][1]["shape"] == [N_T]
+
+    def test_survives_write_metadata(self, tmp_path):
+        w = ZarrWriter(root=tmp_path, schema=make_2d_schema(), overwrite=True, initialize_arrays=True)
+        w.write_metadata(meta={"operator": "x"})
+        attrs = self._zarr_attrs(tmp_path)
+        assert "zarro" in attrs and attrs["operator"] == "x"
+
+    def test_written_by_write_metadata_when_arrays_not_initialized(self, tmp_path):
+        w = ZarrWriter(root=tmp_path, schema=make_2d_schema(), overwrite=True, initialize_arrays=False)
+        w.write_metadata()
+        assert "zarro" in self._zarr_attrs(tmp_path)
+
+    def test_not_exposed_in_vault_metadata(self, tmp_path):
+        ZarrWriter(root=tmp_path, schema=make_2d_schema(), overwrite=True, initialize_arrays=True).write_metadata()
+        assert "zarro" not in Vault(tmp_path).metadata
+
+    def test_vault_readable_with_manifest_only(self, tmp_path):
+        """Mid-run vault with no yaml and no finished attrs still opens, via the manifest."""
+        ZarrWriter(root=tmp_path, schema=make_2d_schema(with_image=True), overwrite=True, initialize_arrays=True)
+        (tmp_path / "metadata.yaml").unlink()
+        v = Vault(tmp_path)
+        assert v.shape == (N_A, N_B)
+        assert v.axes["a"].unit == "V"
+        assert v.readouts["image"].kind == "image" and v.readouts["image"].shape == (N_H, N_W)
+
+    def test_manifest_and_legacy_paths_agree(self, tmp_path):
+        schema = make_trace_with_freq_schema()
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
+        new = Vault(tmp_path)
+        strip_manifest(tmp_path)
+        old = Vault(tmp_path)
+        assert new.readouts == old.readouts
+        assert {k: (a.dim, a.unit, a.length) for k, a in new.axes.items()} == \
+               {k: (a.dim, a.unit, a.length) for k, a in old.axes.items()}
+        np.testing.assert_array_equal(new.trailing_coords["S21"]["freq"], old.trailing_coords["S21"]["freq"])
+
+    def test_legacy_vault_with_trailing_units_reads(self, tmp_path):
+        write_full_image_layers(tmp_path)
+        strip_manifest(tmp_path)
+        v = Vault(tmp_path)
+        assert v.trailing_units["res"]["component"] == ["Hz", "dBm", "deg"]
+        assert v.readouts["res"].trailing_dims == ("component", "sample")
+
+    def test_streaming_writer_manifest_at_init(self, tmp_path):
+        StreamingWriter(root=tmp_path, readouts={"x": (), "sig": (N_T,)}, chunk_size=4)
+        m = self._zarr_attrs(tmp_path)["zarro"]
+        assert m["kind"] == "monitor" and m["axes"] == []
+        assert {(r["name"], r["kind"]) for r in m["readouts"]} == {("x", "scalar"), ("sig", "trace")}
+
+    def test_streaming_manifest_survives_close(self, tmp_path):
+        sw = StreamingWriter(root=tmp_path, readouts={"x": ()}, chunk_size=4)
+        sw.append({"x": 1.0})
+        sw.close(meta={"sensor": "A"})
+        attrs = self._zarr_attrs(tmp_path)
+        assert "zarro" in attrs and attrs["sensor"] == "A"
