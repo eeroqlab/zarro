@@ -88,6 +88,12 @@ class ReadoutSpecs:
     unit: Optional[str | list[str]] = None
     shape: Optional[tuple[int, ...]] = None  # For trace/array data, specify the shape of the trailing dimensions (e.g. trace length or image height/width)
     contains: Optional[str | list[str]] = None
+    trailing_dims: Optional[list[dict]] = None
+    # trailing_dims: ordered list of dicts describing trailing dimensions, e.g.:
+    #   [{"name": "component", "values": ["mag", "phase"]},
+    #    {"name": "freq", "unit": "Hz", "values": np.linspace(4e9, 8e9, 1601)}]
+    # Numeric value arrays are stored in vault.zarr as "{readout_name}.{dim_name}".
+    # String value arrays (e.g. component labels) go into metadata only.
 
 
 @dataclass(slots=True)
@@ -123,6 +129,19 @@ class MeasurementSchema:
         for r in self.readout:
             specs = asdict(r)
             specs.pop("name")
+            # Strip numeric arrays from trailing_dims — they go in zarr, not yaml.
+            # Keep string lists (e.g. component labels) in yaml.
+            if specs.get("trailing_dims"):
+                def _keep_in_meta(k, v):
+                    if k != "values":
+                        return True
+                    if isinstance(v, (list, tuple)):
+                        return bool(v) and isinstance(v[0], str)
+                    return False  # numpy array → goes in zarr
+                specs["trailing_dims"] = [
+                    {k: v for k, v in td.items() if _keep_in_meta(k, v)}
+                    for td in specs["trailing_dims"]
+                ]
             readout_meta[r.name] = specs
 
         self.meta = {
@@ -305,6 +324,24 @@ class ZarrWriter:
                 dtype=self.dtype,  # FIX: use self.dtype instead of hardcoded "float32"
                 overwrite=self.overwrite,
             )
+
+            # Write trailing coord arrays as "{readout_name}.{dim_name}"
+            if readout.trailing_dims:
+                for td in readout.trailing_dims:
+                    values = td.get("values")
+                    if values is None:
+                        continue
+                    values = np.asarray(values)
+                    if not np.issubdtype(values.dtype, np.number):
+                        continue  # string labels go in metadata only
+                    coord_name = f"{readout.name}.{td['name']}"
+                    coord_arr = self.vault.create_array(
+                        name=coord_name,
+                        shape=values.shape,
+                        dtype=values.dtype,
+                        overwrite=self.overwrite,
+                    )
+                    coord_arr[:] = values
 
 
     def _get_chunk_shape(self) -> tuple[int, ...]:

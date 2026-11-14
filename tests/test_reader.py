@@ -614,6 +614,149 @@ class TestStreamingWriter:
 
 
 # ===========================================================================
+# TestToXarray — Vault.to_xarray
+# ===========================================================================
+
+xr = pytest.importorskip("xarray")
+
+
+class TestToXarray:
+
+    def test_scalar_1d_shape_and_dims(self, tmp_path):
+        # make_1d_schema: single dim with two co-swept vars c,d of length N_B
+        schema = make_1d_schema()
+        w = ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        w.write_metadata()
+        for i in range(N_B):
+            w.write_point((i,), {"scalar": 1.0, "trace": np.zeros(N_T)})
+        v = Vault(tmp_path)
+        da = v.to_xarray("scalar")
+        # two co-swept vars on dim0 → dim named "dim0"
+        assert "dim0" in da.dims
+        assert da.shape == (N_B,)
+
+    def test_scalar_1d_both_coords_present(self, tmp_path):
+        schema = make_1d_schema()
+        w = ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        w.write_metadata()
+        for i in range(N_B):
+            w.write_point((i,), {"scalar": 1.0, "trace": np.zeros(N_T)})
+        v = Vault(tmp_path)
+        da = v.to_xarray("scalar")
+        assert "c" in da.coords
+        assert "d" in da.coords
+        np.testing.assert_array_equal(da.coords["c"].values, v.axes["c"].values)
+
+    def test_scalar_2d_shape_and_dims(self, tmp_path):
+        _, _ = finished_vault(tmp_path)
+        v = Vault(tmp_path)
+        da = v.to_xarray("scalar")
+        assert da.dims == ("a", "b")
+        assert da.shape == (N_A, N_B)
+
+    def test_scalar_2d_coords(self, tmp_path):
+        _, _ = finished_vault(tmp_path)
+        v = Vault(tmp_path)
+        da = v.to_xarray("scalar")
+        np.testing.assert_array_equal(da.coords["a"].values, v.axes["a"].values)
+        np.testing.assert_array_equal(da.coords["b"].values, v.axes["b"].values)
+
+    def test_trace_dims(self, tmp_path):
+        _, _ = finished_vault(tmp_path)
+        v = Vault(tmp_path)
+        da = v.to_xarray("trace")
+        assert da.dims == ("a", "b", "sample")
+        assert da.shape == (N_A, N_B, N_T)
+
+    def test_image_dims_no_component(self, tmp_path):
+        write_full_image_layers(tmp_path)
+        v = Vault(tmp_path)
+        da = v.to_xarray("res")
+        # contains=["fpts","mag","phase"] → first trailing dim named "component"
+        assert da.dims == ("a", "b", "component", "sample")
+        assert da.shape == (N_A, N_B, 3, N_T)
+        np.testing.assert_array_equal(da.coords["component"].values, ["fpts", "mag", "phase"])
+
+    def test_image_with_component(self, tmp_path):
+        write_full_image_layers(tmp_path)
+        v = Vault(tmp_path)
+        da = v.to_xarray("res", component="mag")
+        assert da.dims == ("a", "b", "sample")
+        assert da.shape == (N_A, N_B, N_T)
+        assert da.attrs["component"] == "mag"
+
+    def test_units_on_coord(self, tmp_path):
+        _, _ = finished_vault(tmp_path)
+        v = Vault(tmp_path)
+        da = v.to_xarray("scalar")
+        assert da.coords["a"].attrs.get("units") == "V"
+        assert da.coords["b"].attrs.get("units") == "Hz"
+
+    def test_readout_unit_in_attrs(self, tmp_path):
+        _, _ = finished_vault(tmp_path)
+        v = Vault(tmp_path)
+        da = v.to_xarray("scalar")
+        assert da.attrs.get("units") == "dBm"
+
+    def test_nan_at_unwritten_points(self, tmp_path):
+        schema = make_2d_schema()
+        w = ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        w.write_metadata()
+        # write only first row
+        for j in range(N_B):
+            w.write_point((0, j), {"scalar": 1.0, "trace": np.zeros(N_T)})
+        v = Vault(tmp_path)
+        da = v.to_xarray("scalar")
+        assert np.all(np.isfinite(da.values[0]))
+        assert np.all(np.isnan(da.values[1:]))
+
+    def test_long_name_attr(self, tmp_path):
+        _, _ = finished_vault(tmp_path)
+        v = Vault(tmp_path)
+        da = v.to_xarray("scalar")
+        assert da.attrs["long_name"] == "scalar"
+
+    def test_sel_by_coord_value(self, tmp_path):
+        schema = make_2d_schema()
+        w = ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        scalar = np.arange(N_A * N_B, dtype=float).reshape(N_A, N_B)
+        for i in range(N_A):
+            for j in range(N_B):
+                w.write_point((i, j), {"scalar": scalar[i, j], "trace": np.zeros(N_T)})
+        w.write_metadata()
+        v = Vault(tmp_path)
+        da = v.to_xarray("scalar")
+        a_val = v.axes["a"].values[1]
+        sliced = da.sel(a=a_val, method="nearest")
+        np.testing.assert_array_equal(sliced.values, scalar[1])
+
+    def test_isel_by_index(self, tmp_path):
+        schema = make_2d_schema()
+        w = ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        scalar = np.arange(N_A * N_B, dtype=float).reshape(N_A, N_B)
+        for i in range(N_A):
+            for j in range(N_B):
+                w.write_point((i, j), {"scalar": scalar[i, j], "trace": np.zeros(N_T)})
+        w.write_metadata()
+        v = Vault(tmp_path)
+        da = v.to_xarray("scalar")
+        np.testing.assert_array_equal(da.isel(a=0).values, scalar[0])
+
+    def test_no_xarray_raises_import_error(self, tmp_path, monkeypatch):
+        import builtins
+        real_import = builtins.__import__
+        def mock_import(name, *args, **kwargs):
+            if name == "xarray":
+                raise ImportError("no xarray")
+            return real_import(name, *args, **kwargs)
+        _, _ = finished_vault(tmp_path)
+        v = Vault(tmp_path)
+        monkeypatch.setattr(builtins, "__import__", mock_import)
+        with pytest.raises(ImportError, match="xarray"):
+            v.to_xarray("scalar")
+
+
+# ===========================================================================
 # TestFallbacks — control/readouts keyword arguments
 # ===========================================================================
 
@@ -729,3 +872,281 @@ class TestErrors:
         r = repr(v)
         assert "sweep" in r
         assert "3x4" in r
+
+
+# ===========================================================================
+# TestDimNames — Vault.dim_names property and __repr__ role strings
+# ===========================================================================
+
+class TestDimNames:
+
+    def test_1d_dim_names_is_sweep(self, tmp_path):
+        schema = make_1d_schema()
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
+        v = Vault(tmp_path)
+        assert v.dim_names == ["sweep"]
+
+    def test_2d_dim_names_step_sweep(self, tmp_path):
+        schema = make_2d_schema()
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
+        v = Vault(tmp_path)
+        assert v.dim_names == ["step", "sweep"]
+
+    def test_3d_dim_names_frame_step_sweep(self, tmp_path):
+        a = ControlVar("a", np.arange(2, dtype=np.float32))
+        b = ControlVar("b", np.arange(N_A, dtype=np.float32))
+        c = ControlVar("c", np.arange(N_B, dtype=np.float32))
+        schema = MeasurementSchema(
+            control=[AxisSpecs([a]), AxisSpecs([b]), AxisSpecs([c])],
+            readout=[ReadoutSpecs("x", DataKind.SCALAR)],
+            writetype=WriteType.POINTWISE,
+        )
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
+        v = Vault(tmp_path)
+        assert v.dim_names == ["frame", "step", "sweep"]
+
+    def test_1d_repr_says_1d_sweep(self, tmp_path):
+        schema = make_1d_schema()
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
+        v = Vault(tmp_path)
+        assert "1D sweep" in repr(v)
+
+    def test_2d_repr_says_step_sweep(self, tmp_path):
+        schema = make_2d_schema()
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
+        v = Vault(tmp_path)
+        assert "step sweep" in repr(v)
+
+
+# ===========================================================================
+# TestTrailingDims — ReadoutSpecs.trailing_dims, Vault.trailing_coords,
+#                    Readout.trailing_dims, and to_xarray integration
+# ===========================================================================
+
+FREQ_VALS = np.linspace(4e9, 8e9, N_T)
+
+
+def make_trace_with_freq_schema():
+    """2D sweep, TRACE readout with a numeric 'freq' trailing_dim."""
+    a = ControlVar("a", np.linspace(0, 1, N_A, dtype=np.float32), unit="V")
+    b = ControlVar("b", np.linspace(0, 1, N_B, dtype=np.float32), unit="T")
+    return MeasurementSchema(
+        control=[AxisSpecs([a]), AxisSpecs([b])],
+        readout=[
+            ReadoutSpecs(
+                "S21",
+                DataKind.TRACE,
+                shape=(N_T,),
+                unit="dBm",
+                trailing_dims=[{"name": "freq", "unit": "Hz", "values": FREQ_VALS}],
+            ),
+        ],
+        writetype=WriteType.POINTWISE,
+    )
+
+
+def make_trace_with_string_trailing_schema():
+    """TRACE with shape=(2,) whose trailing_dim values are string labels (X, Y)."""
+    a = ControlVar("a", np.linspace(0, 1, N_A, dtype=np.float32))
+    b = ControlVar("b", np.linspace(0, 1, N_B, dtype=np.float32))
+    return MeasurementSchema(
+        control=[AxisSpecs([a]), AxisSpecs([b])],
+        readout=[
+            ReadoutSpecs(
+                "lockin_xy",
+                DataKind.TRACE,
+                shape=(2,),
+                contains=["X", "Y"],
+                trailing_dims=[{"name": "component", "values": ["X", "Y"]}],
+            ),
+        ],
+        writetype=WriteType.POINTWISE,
+    )
+
+
+class TestTrailingDims:
+
+    def test_numeric_coord_array_written_to_zarr(self, tmp_path):
+        """ZarrWriter must create a 'S21.freq' array inside vault.zarr."""
+        schema = make_trace_with_freq_schema()
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
+        import zarr as _zarr
+        g = _zarr.open_group(str(tmp_path / "vault.zarr"), mode="r")
+        assert "S21.freq" in g, "numeric trailing coord array must be written as readout.dimname"
+        np.testing.assert_array_almost_equal(np.asarray(g["S21.freq"][:]), FREQ_VALS)
+
+    def test_string_labels_not_written_to_zarr(self, tmp_path):
+        """String trailing_dim values must stay in metadata.yaml, not appear in vault.zarr."""
+        schema = make_trace_with_string_trailing_schema()
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
+        import zarr as _zarr
+        g = _zarr.open_group(str(tmp_path / "vault.zarr"), mode="r")
+        assert "lockin_xy.component" not in g
+
+    def test_trailing_coords_loaded_on_open_numeric(self, tmp_path):
+        """Vault.trailing_coords is populated with the numeric freq array."""
+        schema = make_trace_with_freq_schema()
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
+        v = Vault(tmp_path)
+        assert "S21" in v.trailing_coords
+        np.testing.assert_array_almost_equal(v.trailing_coords["S21"]["freq"], FREQ_VALS)
+
+    def test_trailing_coords_loaded_on_open_string(self, tmp_path):
+        """String labels are loaded from metadata into trailing_coords."""
+        schema = make_trace_with_string_trailing_schema()
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
+        v = Vault(tmp_path)
+        assert "lockin_xy" in v.trailing_coords
+        np.testing.assert_array_equal(v.trailing_coords["lockin_xy"]["component"], ["X", "Y"])
+
+    def test_readout_trailing_dims_tuple_populated(self, tmp_path):
+        """Readout.trailing_dims reflects the named dims from ReadoutSpecs."""
+        schema = make_trace_with_freq_schema()
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
+        v = Vault(tmp_path)
+        assert v.readouts["S21"].trailing_dims == ("freq",)
+
+    def test_to_xarray_uses_vault_trailing_dims(self, tmp_path):
+        """to_xarray uses vault trailing_dims for dim name and coords (priority 1)."""
+        schema = make_trace_with_freq_schema()
+        w = ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        for i in range(N_A):
+            for j in range(N_B):
+                w.write_point((i, j), {"S21": np.ones(N_T)})
+        w.write_metadata()
+        v = Vault(tmp_path)
+        da = v.to_xarray("S21")
+        assert "freq" in da.dims
+        assert da.shape == (N_A, N_B, N_T)
+        np.testing.assert_array_almost_equal(da.coords["freq"].values, FREQ_VALS)
+
+    def test_to_xarray_trailing_coords_kwarg(self, tmp_path):
+        """trailing_coords= kwarg supplies coords for older vaults (priority 2)."""
+        # finished_vault uses make_2d_schema which has no trailing_dims
+        finished_vault(tmp_path)
+        v = Vault(tmp_path)
+        custom_freq = np.linspace(1e9, 5e9, N_T)
+        da = v.to_xarray("trace", trailing_coords={"freq": custom_freq})
+        assert "freq" in da.dims
+        assert da.shape == (N_A, N_B, N_T)
+        np.testing.assert_array_almost_equal(da.coords["freq"].values, custom_freq)
+
+    def test_to_xarray_trailing_coords_kwarg_no_vault_dims(self, tmp_path):
+        """trailing_coords= is ignored when vault trailing_dims already exist (priority 1 wins)."""
+        schema = make_trace_with_freq_schema()
+        w = ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        for i in range(N_A):
+            for j in range(N_B):
+                w.write_point((i, j), {"S21": np.ones(N_T)})
+        w.write_metadata()
+        v = Vault(tmp_path)
+        wrong_freq = np.zeros(N_T)
+        da = v.to_xarray("S21", trailing_coords={"freq": wrong_freq})
+        # vault trailing_dims take priority — coord must match FREQ_VALS, not wrong_freq
+        np.testing.assert_array_almost_equal(da.coords["freq"].values, FREQ_VALS)
+
+    def test_to_xarray_trailing_dim_unit_in_attrs(self, tmp_path):
+        """Freq coord is present and dim is named 'freq' in the returned DataArray."""
+        schema = make_trace_with_freq_schema()
+        w = ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        for i in range(N_A):
+            for j in range(N_B):
+                w.write_point((i, j), {"S21": np.ones(N_T)})
+        w.write_metadata()
+        v = Vault(tmp_path)
+        da = v.to_xarray("S21")
+        assert "freq" in da.coords
+
+
+# ===========================================================================
+# TestSelectComponentTrace — _select_component fix for TRACE with shape=(2,)
+# ===========================================================================
+
+def make_trace_xy_vault(tmp_path):
+    """2D sweep, TRACE readout with shape=(2,), contains=['X','Y']."""
+    a = ControlVar("a", np.linspace(0, 1, N_A, dtype=np.float32))
+    b = ControlVar("b", np.linspace(0, 1, N_B, dtype=np.float32))
+    schema = MeasurementSchema(
+        control=[AxisSpecs([a]), AxisSpecs([b])],
+        readout=[ReadoutSpecs("lockin_xy", DataKind.TRACE, shape=(2,), contains=["X", "Y"])],
+        writetype=WriteType.POINTWISE,
+    )
+    rng = np.random.default_rng(0)
+    data = rng.random((N_A, N_B, 2), dtype=np.float32)
+    w = ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+    for i in range(N_A):
+        for j in range(N_B):
+            w.write_point((i, j), {"lockin_xy": data[i, j]})
+    w.write_metadata()
+    return data
+
+
+class TestSelectComponentTrace:
+
+    def test_component_x_shape(self, tmp_path):
+        """TRACE with shape=(2,): component='X' must return shape (N_A, N_B)."""
+        make_trace_xy_vault(tmp_path)
+        v = Vault(tmp_path)
+        result = v.read("lockin_xy", component="X")
+        assert result.shape == (N_A, N_B)
+
+    def test_component_x_values(self, tmp_path):
+        data = make_trace_xy_vault(tmp_path)
+        v = Vault(tmp_path)
+        result = v.read("lockin_xy", component="X")
+        np.testing.assert_array_almost_equal(result, data[:, :, 0])
+
+    def test_component_y_values(self, tmp_path):
+        data = make_trace_xy_vault(tmp_path)
+        v = Vault(tmp_path)
+        result = v.read("lockin_xy", component="Y")
+        np.testing.assert_array_almost_equal(result, data[:, :, 1])
+
+    def test_values_component_no_nan_full_run(self, tmp_path):
+        make_trace_xy_vault(tmp_path)
+        v = Vault(tmp_path)
+        result = v.values("lockin_xy", component="X")
+        assert result.shape == (N_A, N_B)
+        assert not np.isnan(result).any()
+
+
+# ===========================================================================
+# TestSnapshot — snapshot() printed output
+# ===========================================================================
+
+class TestSnapshot:
+
+    def test_snapshot_contains_shape_and_kind(self, tmp_path, capsys):
+        schema = make_2d_schema()
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
+        Vault(tmp_path).snapshot()
+        out = capsys.readouterr().out
+        assert "3x4" in out or f"{N_A}x{N_B}" in out
+        assert "sweep" in out
+
+    def test_snapshot_shows_dim_roles(self, tmp_path, capsys):
+        """snapshot() header must include dimension role names for a 2D vault."""
+        schema = make_2d_schema()
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
+        Vault(tmp_path).snapshot()
+        out = capsys.readouterr().out
+        # 2D vault: outermost dim is "step"; kind_str is "2D step sweep"
+        assert "step" in out
+
+    def test_snapshot_shows_all_readouts(self, tmp_path, capsys):
+        schema = make_2d_schema(with_image=True)
+        ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True).write_metadata()
+        Vault(tmp_path).snapshot()
+        out = capsys.readouterr().out
+        assert "scalar" in out
+        assert "trace" in out
+        assert "image" in out
+
+    def test_snapshot_monitor_shows_time_axis(self, tmp_path, capsys):
+        sw = StreamingWriter(root=tmp_path, readouts={"x": ()}, chunk_size=1)
+        sw.append({"x": 1.0})
+        sw.close()
+        Vault(tmp_path).snapshot()
+        out = capsys.readouterr().out
+        assert "monitor" in out
+        assert "sample" in out

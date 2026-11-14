@@ -36,9 +36,11 @@ A comprehensive guide to the `zarro` package for structured experimental data sa
    - [Control axes and coordinates](#82-control-axes-and-coordinates)
    - [Readout metadata](#83-readout-metadata)
    - [Reading data arrays](#84-reading-data-arrays)
-   - [Tracking progress mid-run](#85-tracking-progress-mid-run)
-   - [Monitor runs](#86-monitor-runs-streamingwriter)
-   - [Fallback when metadata is missing](#87-fallback-when-metadata-is-missing)
+   - [xarray integration](#85-xarray-integration)
+   - [Tracking progress mid-run](#86-tracking-progress-mid-run)
+   - [Monitor runs](#87-monitor-runs-streamingwriter)
+   - [Fallback when metadata is missing](#88-fallback-when-metadata-is-missing)
+   - [Low-level zarr access](#89-low-level-zarr-access)
 9. [Experiment ID Management](#9-experiment-id-management)
 10. [NpzWriter](#10-npzwriter)
 11. [Schemaless Writing](#11-schemaless-writing)
@@ -222,6 +224,33 @@ frame = ReadoutSpecs(
 | `unit` | `str \| list[str]` | Physical unit(s) |
 | `shape` | `tuple[int, ...]` | **Required** for TRACE and IMAGE: trailing dimension sizes |
 | `contains` | `str \| list[str]` | Human description of what is measured |
+| `trailing_dims` | `list[dict]` | Named trailing dimensions (see below) |
+
+`trailing_dims` is an ordered list of dicts, one per trailing dimension, from outermost to innermost.  Each dict may contain `name` (str), `unit` (str), and `values` (list or ndarray) for coordinate labels.  String `values` (e.g. component names) are stored in `metadata.yaml`; numeric `values` (e.g. frequency arrays) are written as a companion zarr array `{readout}.{dim_name}` for automatic use by `to_xarray`.
+
+```python
+# TRACE with named frequency axis
+s21 = ReadoutSpecs(
+    name="S21",
+    kind=DataKind.TRACE,
+    shape=(1601,),
+    unit="dBm",
+    trailing_dims=[
+        {"name": "freq", "unit": "Hz", "values": np.linspace(4e9, 8e9, 1601)},
+    ],
+)
+
+# IMAGE with named component layers and a spatial axis
+result = ReadoutSpecs(
+    name="resonance",
+    kind=DataKind.IMAGE,
+    shape=(3, 801),
+    trailing_dims=[
+        {"name": "component", "values": ["fpts", "mag", "phase"]},
+        {"name": "freq", "unit": "Hz", "values": np.linspace(4e9, 8e9, 801)},
+    ],
+)
+```
 
 ### 3.4 MeasurementSchema
 
@@ -389,6 +418,35 @@ S21 array shape → (20, 101, 1601)
 ReadoutSpecs("S21", DataKind.TRACE, shape=(1601,))
 ```
 
+Use `trailing_dims` to name the trace axis and store its coordinate values. The writer saves numeric values as a companion zarr array (`S21.freq`), which the reader picks up automatically for `to_xarray`:
+
+```python
+ReadoutSpecs(
+    "S21",
+    DataKind.TRACE,
+    shape=(1601,),
+    unit="dBm",
+    trailing_dims=[
+        {"name": "freq", "unit": "Hz", "values": np.linspace(4e9, 8e9, 1601)},
+    ],
+)
+# → run.to_xarray("S21") has dims ("power", "freq") with freq coords attached
+```
+
+A TRACE whose samples represent named channels (e.g. lock-in X/Y) uses a string `values` list. String labels are stored in `metadata.yaml` only (no extra zarr array):
+
+```python
+ReadoutSpecs(
+    "lockin_xy",
+    DataKind.TRACE,
+    shape=(2,),
+    contains=["X", "Y"],
+    trailing_dims=[{"name": "component", "values": ["X", "Y"]}],
+)
+# → run.to_xarray("lockin_xy") has a "component" dim with ["X","Y"] coords
+# → run.values("lockin_xy", component="X") selects the X layer
+```
+
 ### 5.3 IMAGE readouts
 
 Each write delivers a 2-D array per readout. The stored array shape is `control_shape + (H, W)`.
@@ -400,6 +458,23 @@ frame array shape → (10, 480, 640)
 
 ```python
 ReadoutSpecs("frame", DataKind.IMAGE, shape=(480, 640))
+```
+
+Use `trailing_dims` to name both trailing axes and attach coordinate arrays. This is especially useful when the two dimensions represent physically meaningful quantities (e.g. named layers × frequency):
+
+```python
+ReadoutSpecs(
+    "resonance",
+    DataKind.IMAGE,
+    shape=(3, 801),
+    contains=["fpts", "mag", "phase"],
+    trailing_dims=[
+        {"name": "component", "values": ["fpts", "mag", "phase"]},
+        {"name": "freq", "unit": "Hz", "values": np.linspace(4e9, 8e9, 801)},
+    ],
+)
+# → run.to_xarray("resonance") has dims (..., "component", "freq")
+# → run.to_xarray("resonance", component="mag") drops the component dim
 ```
 
 ### 5.4 Mixed readouts
@@ -525,15 +600,15 @@ run.snapshot()
 Example output for a 2D sweep:
 
 ```
-Kind:  sweep       Shape: 20x1601       Date: 2026-11-12T14:03:21
+Kind:  sweep       Shape: 20x1601 (step sweep)   Date: 2026-11-12T14:03:21
 Tags:  vna, 2K
 Path:  ./data/run_001
 
 Control axes
-axis    variable      length  unit
-------  ----------  --------  ------
-axis0   power             20  dBm
-axis1   freq            1601  Hz
+axis    role    variable      length  unit
+------  ------  ----------  --------  ------
+axis0   step    power             20  dBm
+axis1   sweep   freq            1601  Hz
 
 Readouts
 name      kind    shape     unit    contains
@@ -541,6 +616,8 @@ name      kind    shape     unit    contains
 S21_mag   scalar  ()        dBm     —
 S21       trace   (1601,)   V       S21
 ```
+
+Dimension roles — `sweep` (innermost / fastest), `step`, `frame`, `volume` (slowest) — appear in the shape header and in the axis table's role column.  A 3D sweep would read `frame step sweep`.
 
 For a **monitor** run the control-axes block is replaced by `Time axis: N samples`.
 
@@ -615,7 +692,95 @@ run.values("resonance", component="mag")        # shape (20, 1601, 801), NaN at 
 # passing component= to a SCALAR or TRACE readout raises VaultError
 ```
 
-### 8.5 Tracking progress mid-run
+### 8.5 xarray integration
+
+`to_xarray` wraps any readout as an `xarray.DataArray` with labeled
+coordinates, so you get slicing, interpolation, and plotting for free.
+
+```python
+da = run.to_xarray("S21_mag")
+# <xarray.DataArray 'S21_mag' (Vch: 20, Vg: 50)>
+# Coordinates:
+#   * Vch  (Vch) float32 -0.5 ... 0.5   [units: V]
+#   * Vg   (Vg)  float32 -1.0 ... 1.0   [units: V]
+# Attributes: units: dBm, long_name: S21_mag
+```
+
+**Selecting a slice by value:**
+
+```python
+# fix Vch to nearest point, return 1-D array along Vg
+da.sel(Vch=0.0, method="nearest")
+
+# fix both axes → scalar DataArray
+da.sel(Vch=0.0, Vg=-0.5, method="nearest")
+
+# range slice along Vg
+da.sel(Vg=slice(-0.3, 0.3))
+
+# by integer index
+da.isel(Vch=5)
+```
+
+**Check which coordinate value was actually selected:**
+
+```python
+sliced = da.sel(Vch=0.03, method="nearest")
+sliced.coords["Vch"].item()   # e.g. 0.025
+```
+
+**Plotting:**
+
+```python
+da.plot()                                       # 2-D heatmap, axis-labeled
+da.sel(Vch=0.0, method="nearest").plot()        # 1-D line along Vg
+da.plot.pcolormesh(cmap="RdBu_r")
+```
+
+**IMAGE readouts with named components:**
+
+```python
+# resonance: shape (20, 50, 3, 801), contains=['fpts','mag','phase']
+da_mag = run.to_xarray("resonance", component="mag")   # shape (20, 50, 801)
+da_mag.sel(Vch=0.0, method="nearest").plot()           # 2-D map: Vg vs freq
+```
+
+**Multi-control axes** (two variables swept together on the same dimension):
+
+```python
+# dim named "dim0" when multiple variables share it; both appear as coords
+da.coords["Vch"].values    # coord array for first variable
+da.coords["Vg"].values     # coord array for second variable (same length)
+da.sel(Vch=0.0, method="nearest")   # still works — selects along dim0
+```
+
+**Labeled trailing dimensions (`trailing_dims`):**
+
+When a readout was written with `trailing_dims` in its `ReadoutSpecs`, `to_xarray` automatically attaches named coordinates for those dimensions:
+
+```python
+# S21 written with trailing_dims=[{"name":"freq","unit":"Hz","values":...}]
+da = run.to_xarray("S21")
+# <xarray.DataArray 'S21' (power: 20, freq: 1601)>
+# Coordinates:
+#   * power  (power) float32  [units: dBm]
+#   * freq   (freq)  float64 4.0e9 ... 8.0e9  [units: Hz]
+```
+
+For older vaults without stored trailing coords, pass them explicitly with `trailing_coords=`:
+
+```python
+da = run.to_xarray("S21", trailing_coords={
+    "freq": np.linspace(4e9, 8e9, 1601),
+})
+```
+
+The `trailing_coords=` dict maps dimension names to 1-D coordinate arrays.
+
+Unwritten grid points appear as `NaN`, same as `values()`.  xarray is an
+optional dependency; a clear `ImportError` is raised if it is not installed.
+
+### 8.6 Tracking progress mid-run
 
 `written_mask` returns a boolean grid that is True where data has been written.
 It works on running sweeps without blocking the writer.
@@ -638,7 +803,7 @@ mask = run.written_mask("S21_mag", order=my_order_array)
   position is also counted as written (order-prefix rule), so a genuine 0.0
   inside the scanned region remains visible.
 
-### 8.6 Monitor runs (StreamingWriter)
+### 8.7 Monitor runs (StreamingWriter)
 
 ```python
 run = open_vault("./data/mon_001")
@@ -652,7 +817,7 @@ x_values = run.values("x")   # shape (n_samples,), always fully written
 The vault can be opened before the writer calls `close()`.
 The readout shapes are inferred automatically from the array dimensions.
 
-### 8.7 Fallback when metadata is missing
+### 8.8 Fallback when metadata is missing
 
 If `metadata.yaml` is gone and zarr attributes were never written, pass the
 structure explicitly:
@@ -665,7 +830,7 @@ run = Vault(
 )
 ```
 
-### 8.8 Low-level zarr access
+### 8.9 Low-level zarr access
 
 The underlying zarr group is always accessible for direct numpy-style reads:
 
@@ -1032,8 +1197,10 @@ ReadoutSpecs(
     name: str,
     kind: DataKind,
     unit: str | list[str] = None,
-    shape: tuple[int, ...] = None,    # required for TRACE and IMAGE
+    shape: tuple[int, ...] = None,          # required for TRACE and IMAGE
     contains: str | list[str] = None,
+    trailing_dims: list[dict] = None,       # named trailing dimensions
+    # each dict: {"name": str, "unit": str, "values": array | list}
 )
 ```
 
@@ -1149,7 +1316,10 @@ from zarro.reader import Axis, Readout
 
 #### `open_vault(path)`
 
-Convenience wrapper — returns `Vault(path)`.
+Returns `Vault(path)`.  When the exact path does not exist and its final
+component is a 4-digit experiment ID (e.g. `"0007"`), the parent directory is
+searched for a folder whose name starts with that ID (e.g. `"0007_blabla"`).
+Raises `VaultError` if zero or more than one match is found.
 
 #### `Vault(path, *, control=None, readouts=None)`
 
@@ -1164,6 +1334,7 @@ Open a run directory for reading.
 | `axes` | `dict[str, Axis]` | Keyed by variable name; empty for monitors |
 | `readouts` | `dict[str, Readout]` | One entry per data array |
 | `time` | `np.ndarray` | Unix timestamps (monitors only) |
+| `dim_names` | `list[str]` | Dimension role names for all grid dims, e.g. `["step", "sweep"]` |
 
 Methods:
 
@@ -1172,9 +1343,16 @@ vault.read(name, selection=Ellipsis, *, component=None) → np.ndarray  # 0.0 at
 vault.values(name, *, component=None) → np.ndarray                    # NaN at unwritten
 vault.written_mask(name, order=None) → np.ndarray                     # bool grid
 vault.snapshot()                                                        # print summary
+vault.to_xarray(
+    name,
+    *,
+    component=None,              # select one named layer (removes layer dim)
+    trailing_coords=None,        # {dim_name: array} — override / supply coords for old vaults
+) → xr.DataArray
 
 # component= selects one named layer of an IMAGE readout whose contains is a list.
-# The layer dimension is removed from the result.
+# trailing_coords= is a fallback for vaults written without trailing_dims in ReadoutSpecs.
+# to_xarray raises ImportError when xarray is not installed.
 ```
 
 #### `Axis`
@@ -1201,6 +1379,7 @@ class Readout:
     shape: tuple[int, ...]              # trailing shape; () for scalar
     unit: str | list[str] | None
     contains: str | list[str] | None
+    trailing_dims: tuple[str, ...]      # ordered dim names, e.g. ("freq",) or ("component", "freq")
 ```
 
 #### `VaultError`

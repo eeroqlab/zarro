@@ -35,6 +35,20 @@ import zarr
 __all__ = ["Axis", "Readout", "Vault", "VaultError", "open_vault"]
 
 
+_DIM_NAMES = ("sweep", "step", "frame", "volume")
+
+
+def _dim_name(d: int, n_dims: int) -> str:
+    """Human-readable role name for grid dimension *d* out of *n_dims* total.
+
+    The last axis (highest index) is always "sweep", the second-to-last is
+    "step", etc. — matching zarro's writing convention where the innermost
+    loop has the highest axis index.
+    """
+    reverse = n_dims - 1 - d
+    return _DIM_NAMES[reverse] if reverse < len(_DIM_NAMES) else f"dim{d}"
+
+
 class VaultError(Exception):
     """The directory is not a readable zarro run."""
 
@@ -55,6 +69,7 @@ class Axis:
     dim: int             # index of the grid dimension this variable spans
 
 
+
 @dataclass(frozen=True)
 class Readout:
     """One recorded readout. ``shape`` is the trailing shape: ``()`` for a scalar."""
@@ -64,6 +79,9 @@ class Readout:
     shape: tuple[int, ...]
     unit: str | list[str] | None = None
     contains: str | list[str] | None = None
+    trailing_dims: tuple[str, ...] = ()
+    # Ordered trailing dimension names (e.g. ("component", "freq")).
+    # Coordinate values are in Vault.trailing_coords[name][dim_name].
 
 
 def load_yaml(path: Path) -> dict:
@@ -137,6 +155,7 @@ class Vault:
 
         self.axes: dict[str, Axis] = {}
         self.readouts: dict[str, Readout] = {}
+        self.trailing_coords: dict[str, dict[str, np.ndarray]] = {}
 
         if self.kind == "sweep":
             self._load_axes(control)
@@ -172,7 +191,8 @@ class Vault:
         specs = specs or fallback
         if not specs:
             names = list(self.metadata.get("readouts") or []) or [
-                n for n in self._group.array_keys() if n != "_time" and n not in self.axes
+                n for n in self._group.array_keys()
+                if n != "_time" and n not in self.axes and "." not in n
             ]
             specs = {n: {} for n in names}
         lead = len(self.shape) if self.kind == "sweep" else 1
@@ -180,13 +200,30 @@ class Vault:
             if name not in self._group:
                 continue
             trailing = tuple(self._group[name].shape[lead:])
+            td_specs = spec.get("trailing_dims") or []
+            td_names = tuple(td["name"] for td in td_specs if isinstance(td, dict))
             self.readouts[name] = Readout(
                 name=name,
                 kind=spec.get("kind") or _infer_kind(trailing),
                 shape=trailing,
                 unit=spec.get("unit"),
                 contains=spec.get("contains"),
+                trailing_dims=td_names,
             )
+            # Load numeric trailing coord arrays stored as "{name}.{dim_name}"
+            tc: dict[str, np.ndarray] = {}
+            for td in td_specs:
+                if not isinstance(td, dict):
+                    continue
+                dim_name = td["name"]
+                zarr_key = f"{name}.{dim_name}"
+                if zarr_key in self._group:
+                    tc[dim_name] = np.asarray(self._group[zarr_key][:])
+                elif isinstance(td.get("values"), list):
+                    # string labels stored in metadata
+                    tc[dim_name] = np.asarray(td["values"])
+            if tc:
+                self.trailing_coords[name] = tc
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -197,6 +234,16 @@ class Vault:
         for ax in self.axes.values():
             dim_length.setdefault(ax.dim, ax.length)
         return tuple(dim_length[d] for d in sorted(dim_length))
+
+    @property
+    def dim_names(self) -> list[str]:
+        """Ordered role names for each grid dimension.
+
+        The last entry is always ``"sweep"`` (innermost loop), working outward:
+        ``["sweep"]``, ``["step", "sweep"]``, ``["frame", "step", "sweep"]``, …
+        """
+        n = len(self.shape)
+        return [_dim_name(d, n) for d in range(n)]
 
     @property
     def time(self) -> np.ndarray:
@@ -238,9 +285,10 @@ class Vault:
                 f"available: {contains}"
             )
         idx = contains.index(component)
-        # IMAGE always has 2 trailing dims: (n_layers, n_points).
-        # After any selection the layer axis is always data.ndim - 2.
-        return np.take(data, idx, axis=data.ndim - 2)
+        # Layer axis = first trailing dim = data.ndim - n_trailing.
+        # Works for TRACE with shape=(n_layers,) and IMAGE with shape=(n_layers, n_pts).
+        n_trailing = len(r.shape) if r is not None else 2
+        return np.take(data, idx, axis=data.ndim - n_trailing)
 
     def values(self, name: str, *, component: str | None = None) -> np.ndarray:
         """Whole readout as floats, NaN where nothing has been written yet.
@@ -328,6 +376,123 @@ class Vault:
         walk(str(root), ())
         return found
 
+    def to_xarray(self, name: str, *, component: str | None = None,
+                  trailing_coords: dict | None = None):
+        """Return a readout as an :class:`xarray.DataArray` with labeled axes.
+
+        Coordinate arrays from :attr:`axes` are attached as named coordinates.
+        NaN is used for unwritten grid points (same as :meth:`values`).
+        Units, when present, are stored in ``.attrs["units"]``.
+
+        Trailing dimension names and coordinate values are resolved in this order:
+
+        1. ``trailing_dims`` stored in the vault (written via ``ReadoutSpecs.trailing_dims``).
+        2. ``trailing_coords`` keyword argument — a ``{dim_name: array}`` dict
+           supplied by the caller (useful for older vaults that predate option 1).
+        3. ``contains`` as a list → first trailing dim named ``"component"``
+           with those labels as coordinate values.
+        4. Generic fallback: ``"sample"`` (1 trailing dim) or ``"row"`` / ``"col"``
+           (2 trailing dims, unselected IMAGE).
+
+        Parameters
+        ----------
+        component : str, optional
+            Select one named layer of an IMAGE readout before wrapping (see
+            :meth:`read`).  The layer dimension is removed from the result.
+        trailing_coords : dict, optional
+            ``{dim_name: array}`` mapping to attach as coordinates on trailing
+            dimensions.  Applied in insertion order to the trailing axes.
+
+        Raises
+        ------
+        ImportError
+            If xarray is not installed.
+        """
+        try:
+            import xarray as xr
+        except ImportError:
+            raise ImportError(
+                "xarray is required for to_xarray(): pip install xarray"
+            ) from None
+
+        data = self.values(name, component=component)
+        rd = self.readouts.get(name)
+
+        # ── grid dims ────────────────────────────────────────────────────
+        from collections import defaultdict
+        dim_axes: dict[int, list] = defaultdict(list)
+        for ax in self.axes.values():
+            dim_axes[ax.dim].append(ax)
+
+        n_grid = len(dim_axes)
+        dims: list[str] = []
+        coords: dict = {}
+        for d in sorted(dim_axes):
+            axes_on_dim = dim_axes[d]
+            dim_name = axes_on_dim[0].name if len(axes_on_dim) == 1 else f"dim{d}"
+            dims.append(dim_name)
+            for ax in axes_on_dim:
+                coords[ax.name] = (dim_name, ax.values)
+
+        # ── trailing dims ─────────────────────────────────────────────────
+        n_trailing = data.ndim - n_grid
+
+        # Priority 1: trailing_dims stored in vault
+        vault_td = rd.trailing_dims if rd is not None else ()
+        # After component= selection the component dim is gone; remove it
+        if component is not None and vault_td and vault_td[0] == "component":
+            vault_td = vault_td[1:]
+        vault_tc = self.trailing_coords.get(name, {})
+
+        if vault_td:
+            td_names = list(vault_td[:n_trailing])
+            # pad with generic names if metadata has fewer entries than trailing dims
+            while len(td_names) < n_trailing:
+                td_names.append(f"dim_{len(dims) + len(td_names)}")
+            for dn in td_names:
+                dims.append(dn)
+                val = vault_tc.get(dn) if dn in vault_tc else (
+                    trailing_coords.get(dn) if trailing_coords else None
+                )
+                if val is not None:
+                    coords[dn] = np.asarray(val)
+
+        # Priority 2: caller-supplied trailing_coords (old vaults)
+        elif trailing_coords:
+            for dn, val in list(trailing_coords.items())[:n_trailing]:
+                dims.append(dn)
+                coords[dn] = np.asarray(val)
+            # pad if fewer entries than trailing dims
+            while len(dims) - n_grid < n_trailing:
+                dims.append(f"dim_{len(dims)}")
+
+        # Priority 3: contains as list → component dim
+        elif rd is not None and isinstance(rd.contains, list) and component is None:
+            dims.append("component")
+            coords["component"] = np.asarray(rd.contains)
+            if n_trailing == 2:
+                dims.append("sample")
+
+        # Priority 4: generic fallback
+        elif n_trailing == 1:
+            dims.append("sample")
+        elif n_trailing == 2:
+            dims.extend(["row", "col"])
+
+        # ── build DataArray ───────────────────────────────────────────────
+        da = xr.DataArray(data, dims=dims, coords=coords)
+
+        for ax in self.axes.values():
+            if ax.unit and ax.name in da.coords:
+                da.coords[ax.name].attrs["units"] = ax.unit
+        if rd is not None and rd.unit:
+            da.attrs["units"] = rd.unit
+        da.attrs["long_name"] = name
+        if component is not None:
+            da.attrs["component"] = component
+
+        return da
+
     def snapshot(self) -> None:
         """Print a human-readable summary of the vault."""
         try:
@@ -338,8 +503,14 @@ class Vault:
         shape_str = "x".join(map(str, self.shape))
         date = self.metadata.get("date", "—")
         tags_str = ", ".join(self.tags) if self.tags else "—"
+        ndim = len(self.shape)
+        if self.kind == "sweep":
+            outermost = _dim_name(0, ndim)   # slowest loop = highest-level name
+            kind_str = f"{ndim}D {outermost} sweep" if ndim > 1 else "1D sweep"
+        else:
+            kind_str = self.kind
 
-        print(f"Kind:  {self.kind:<10}  Shape: {shape_str:<12}  Date: {date}")
+        print(f"Kind:  {kind_str:<18}  Shape: {shape_str:<12}  Date: {date}")
         print(f"Tags:  {tags_str}")
         print(f"Path:  {self.path}")
 
@@ -347,10 +518,10 @@ class Vault:
             print()
             axis_rows = []
             for ax in self.axes.values():
-                axis_rows.append([f"dim{ax.dim}", ax.name, ax.length, ax.unit or "—"])
+                axis_rows.append([_dim_name(ax.dim, ndim), ax.name, ax.length, ax.unit or "—"])
             _print_table(
                 axis_rows,
-                headers=["axis", "variable", "length", "unit"],
+                headers=["role", "variable", "length", "unit"],
                 title="Control axes",
                 tabulate=tabulate,
             )
@@ -378,7 +549,13 @@ class Vault:
 
     def __repr__(self) -> str:
         shape = "x".join(map(str, self.shape))
-        return f"{type(self).__name__}({self.path.name!r}, {self.kind}, shape={shape})"
+        ndim = len(self.shape)
+        if self.kind == "sweep":
+            outermost = _dim_name(0, ndim)
+            kind_str = f"{ndim}D {outermost} sweep" if ndim > 1 else "1D sweep"
+        else:
+            kind_str = self.kind
+        return f"{type(self).__name__}({self.path.name!r}, {kind_str}, shape={shape})"
 
 
 def open_vault(path: str | Path) -> Vault:

@@ -1,6 +1,14 @@
 CHANGES
 =======
 
+[2026-11-14]
+- reader: fix _select_component layer_axis for TRACE readouts with shape=(N,)
+  and contains as a list; previously used hardcoded data.ndim-2 (IMAGE assumption),
+  now uses data.ndim - len(r.shape) so TRACE layers are selected correctly
+- docs: document trailing_dims in ReadoutSpecs (§3.3, §14), to_xarray trailing_coords=
+  kwarg (§8.5, §14), Vault.dim_names property (§14), sweep/step/frame/volume roles
+  in snapshot() example (§8.1), and Readout.trailing_dims field (§14)
+
 [2026-11-12]
 - reader: added Vault / open_vault / VaultError / Axis / Readout (src/zarro/reader.py)
   * sweep and monitor (StreamingWriter) vaults
@@ -14,6 +22,25 @@ CHANGES
   (reader handles both old list format and new dict format)
 - tests: added tests/test_reader.py with comprehensive reader coverage
 - docs: rewrote section 8 "Reading Data" (8 subsections) and added reader API to section 14
+- core/reader: trailing dimension labeling for to_xarray()
+  * ReadoutSpecs.trailing_dims — ordered list of {name, unit, values} dicts
+  * ZarrWriter writes numeric trailing coord arrays as "{readout}.{dim_name}"
+    in vault.zarr; string labels (e.g. component names) stay in metadata.yaml
+  * Vault.trailing_coords — {readout_name: {dim_name: np.ndarray}} loaded on open
+  * Readout.trailing_dims — tuple of dim name strings
+  * to_xarray() layered fallback: vault trailing_dims → trailing_coords= kwarg
+    → contains-as-list → generic "sample"/"row"/"col"
+  * to_xarray() now accepts trailing_coords= kwarg for older vaults
+  * contains as list → "component" dim with coordinate labels (priority 3)
+- reader: sweep/step/frame/volume dimension naming
+  * _dim_name(d) helper maps grid dimension index to role name
+  * Axis.dim_name property: "sweep", "step", "frame", "volume"
+  * Vault.dim_names property: ordered list for all grid dims
+  * snapshot() header now shows e.g. "2D step sweep"; axis table shows role column
+  * repr() updated to match
+- reader: added Vault.to_xarray(name, *, component=None) — wraps a readout as
+  an xarray.DataArray with labeled coordinates, units in .attrs, and NaN at
+  unwritten points; raises ImportError when xarray is not installed
 - reader: open_vault now accepts a 4-digit experiment ID; searches the parent
   directory for a folder whose name starts with that ID (e.g. "0007_blabla"
   matches "0007"); raises VaultError on no match or ambiguous match
