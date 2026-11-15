@@ -21,6 +21,7 @@ from zarro.core import (
     MeasurementSchema,
     NpzWriter,
     ReadoutSpecs,
+    StreamingWriter,
     WriteType,
     ZarrWriter,
     compute_sharding,
@@ -682,3 +683,166 @@ class TestNpzWriter:
 
         content = yaml.safe_load((tmp_path / "metadata.yaml").read_text())
         assert content["experiment"] == "demo"
+
+
+# ===========================================================================
+# ReadoutSpecs validation and normalization
+# ===========================================================================
+
+class TestReadoutSpecsValidation:
+
+    def test_scalar_with_or_without_empty_shape_ok(self):
+        ReadoutSpecs("x", DataKind.SCALAR)
+        ReadoutSpecs("x", DataKind.SCALAR, shape=())
+
+    @pytest.mark.parametrize("kind, shape", [
+        (DataKind.SCALAR, (3,)),
+        (DataKind.TRACE, None),
+        (DataKind.TRACE, ()),
+        (DataKind.TRACE, (2, 3)),
+        (DataKind.IMAGE, (4,)),
+        (DataKind.IMAGE, (2, 3, 4)),
+    ])
+    def test_kind_shape_mismatch_raises(self, kind, shape):
+        with pytest.raises(ValueError, match="needs a"):
+            ReadoutSpecs("x", kind, shape=shape)
+
+    def test_kind_given_as_string_is_coerced(self):
+        r = ReadoutSpecs("x", "trace", shape=(3,))
+        assert r.kind is DataKind.TRACE
+
+    def test_shape_list_is_tuple(self):
+        assert ReadoutSpecs("x", DataKind.TRACE, shape=[3]).shape == (3,)
+
+    def test_contains_list_promoted_to_component_dim(self):
+        r = ReadoutSpecs("x", DataKind.TRACE, shape=(2,), contains=["X", "Y"])
+        assert r.trailing_dims == [{"name": "component", "values": ["X", "Y"]}]
+
+    def test_contains_list_on_scalar_is_not_promoted(self):
+        r = ReadoutSpecs("x", DataKind.SCALAR, contains=["a", "b"])
+        assert r.trailing_dims is None
+
+    def test_contains_string_not_promoted(self):
+        assert ReadoutSpecs("x", DataKind.TRACE, shape=(2,), contains="desc").trailing_dims is None
+
+    def test_explicit_trailing_dims_beat_contains(self):
+        r = ReadoutSpecs("x", DataKind.TRACE, shape=(2,), contains=["X", "Y"],
+                         trailing_dims=[{"name": "ch", "values": ["a", "b"]}])
+        assert r.trailing_dims[0]["name"] == "ch"
+
+    def test_contains_length_must_match_shape(self):
+        with pytest.raises(ValueError, match="expected \\(2,\\)"):
+            ReadoutSpecs("x", DataKind.TRACE, shape=(2,), contains=["X", "Y", "Z"])
+
+    def test_too_many_trailing_dims_raises(self):
+        with pytest.raises(ValueError, match="trailing_dims"):
+            ReadoutSpecs("x", DataKind.TRACE, shape=(3,),
+                         trailing_dims=[{"name": "a"}, {"name": "b"}])
+
+    def test_partial_trailing_dims_allowed(self):
+        r = ReadoutSpecs("x", DataKind.IMAGE, shape=(3, 4), trailing_dims=[{"name": "component"}])
+        assert len(r.trailing_dims) == 1
+
+    def test_numeric_values_length_must_match(self):
+        with pytest.raises(ValueError, match="expected \\(5,\\)"):
+            ReadoutSpecs("x", DataKind.TRACE, shape=(5,),
+                         trailing_dims=[{"name": "freq", "values": np.arange(4.0)}])
+
+    def test_units_length_must_match(self):
+        with pytest.raises(ValueError, match="needs 2 units"):
+            ReadoutSpecs("x", DataKind.TRACE, shape=(2,),
+                         trailing_dims=[{"name": "component", "values": ["a", "b"], "units": ["V"]}])
+
+    def test_duplicate_names_raise(self):
+        with pytest.raises(ValueError, match="duplicate"):
+            ReadoutSpecs("x", DataKind.IMAGE, shape=(2, 2),
+                         trailing_dims=[{"name": "a"}, {"name": "a"}])
+
+    def test_entry_without_name_raises(self):
+        with pytest.raises(ValueError, match="'name'"):
+            ReadoutSpecs("x", DataKind.TRACE, shape=(2,), trailing_dims=[{"values": ["a", "b"]}])
+
+    def test_string_ndarray_values_become_list(self):
+        r = ReadoutSpecs("x", DataKind.TRACE, shape=(2,),
+                         trailing_dims=[{"name": "c", "values": np.array(["a", "b"])}])
+        assert r.trailing_dims[0]["values"] == ["a", "b"]
+
+    def test_callers_dicts_not_mutated(self):
+        td = [{"name": "c", "values": np.array(["a", "b"]), "units": ("V", "A")}]
+        ReadoutSpecs("x", DataKind.TRACE, shape=(2,), trailing_dims=td)
+        assert isinstance(td[0]["values"], np.ndarray) and td[0]["units"] == ("V", "A")
+
+    def test_schema_manifest_strips_numeric_values_keeps_labels_and_units(self):
+        ctl = AxisSpecs([ControlVar("a", np.arange(2.0))])
+        r = ReadoutSpecs("r", DataKind.IMAGE, shape=(2, 3), unit="V", trailing_dims=[
+            {"name": "component", "values": ["m", "p"], "units": ["dB", "deg"]},
+            {"name": "freq", "unit": "Hz", "values": np.arange(3.0)},
+        ])
+        m = MeasurementSchema(control=[ctl], readout=[r]).manifest["readouts"][0]
+        assert m["kind"] == "image" and m["shape"] == [2, 3] and m["unit"] == "V"
+        assert m["trailing_dims"] == [
+            {"name": "component", "values": ["m", "p"], "units": ["dB", "deg"]},
+            {"name": "freq", "unit": "Hz"},
+        ]
+
+
+# ===========================================================================
+# StreamingWriter with ReadoutSpecs
+# ===========================================================================
+
+FREQ = np.linspace(4e9, 8e9, 5)
+
+
+class TestStreamingWriterSpecs:
+
+    def _attrs(self, path):
+        return dict(zarr.open_group(str(path / "vault.zarr"), mode="r").attrs)
+
+    def test_tuple_only_unchanged(self, tmp_path):
+        StreamingWriter(root=tmp_path, readouts={"x": (), "sig": (4,)})
+        m = {r["name"]: r for r in self._attrs(tmp_path)["zarro"]["readouts"]}
+        assert m["x"] == {"name": "x", "kind": "scalar", "shape": [], "unit": None,
+                          "contains": None, "trailing_dims": []}
+        assert m["sig"]["kind"] == "trace" and m["sig"]["shape"] == [4]
+
+    def test_spec_fields_in_manifest_at_init(self, tmp_path):
+        spec = ReadoutSpecs("S21", DataKind.TRACE, shape=(5,), unit="dBm",
+                            trailing_dims=[{"name": "freq", "unit": "Hz", "values": FREQ}])
+        StreamingWriter(root=tmp_path, readouts={"S21": spec})   # not closed
+        m = self._attrs(tmp_path)["zarro"]["readouts"][0]
+        assert (m["kind"], m["shape"], m["unit"]) == ("trace", [5], "dBm")
+        assert m["trailing_dims"] == [{"name": "freq", "unit": "Hz"}]   # numeric values stripped
+
+    def test_numeric_trailing_array_written_and_data_array_shape(self, tmp_path):
+        spec = ReadoutSpecs("S21", DataKind.TRACE, shape=(5,),
+                            trailing_dims=[{"name": "freq", "values": FREQ}])
+        sw = StreamingWriter(root=tmp_path, readouts={"S21": spec})
+        g = zarr.open_group(str(tmp_path / "vault.zarr"), mode="r")
+        np.testing.assert_array_equal(g["S21.freq"][:], FREQ)
+        assert g["S21"].shape == (0, 5)
+        sw.append({"S21": np.ones(5)}); sw.flush()
+        assert zarr.open_group(str(tmp_path / "vault.zarr"), mode="r")["S21"].shape == (1, 5)
+
+    def test_name_mismatch_raises_before_creating_anything(self, tmp_path):
+        spec = ReadoutSpecs("other", DataKind.SCALAR)
+        with pytest.raises(ValueError, match="does not match"):
+            StreamingWriter(root=tmp_path / "run", readouts={"x": spec})
+        assert not (tmp_path / "run" / "vault.zarr").exists()
+
+    def test_close_keeps_readouts_shape_mapping(self, tmp_path):
+        spec = ReadoutSpecs("S21", DataKind.TRACE, shape=(5,))
+        sw = StreamingWriter(root=tmp_path, readouts={"x": (), "S21": spec, "f": (2, 3)})
+        sw.append({"x": 1.0, "S21": np.ones(5), "f": np.ones((2, 3))})
+        sw.close()
+        assert self._attrs(tmp_path)["readouts"] == {"x": [], "S21": [5], "f": [2, 3]}
+        assert "zarro" in self._attrs(tmp_path)
+
+    def test_mixed_dict(self, tmp_path):
+        spec = ReadoutSpecs("v", DataKind.SCALAR, unit="V")
+        StreamingWriter(root=tmp_path, readouts={"v": spec, "raw": (3,)})
+        m = {r["name"]: r for r in self._attrs(tmp_path)["zarro"]["readouts"]}
+        assert m["v"]["unit"] == "V" and m["raw"]["unit"] is None and m["raw"]["kind"] == "trace"
+
+    def test_tuple_path_still_accepts_3d_shape(self, tmp_path):
+        StreamingWriter(root=tmp_path, readouts={"vol": (2, 2, 2)})
+        assert self._attrs(tmp_path)["zarro"]["readouts"][0]["kind"] == "image"

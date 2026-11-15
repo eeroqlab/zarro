@@ -93,6 +93,53 @@ class ReadoutSpecs:
     # String value arrays (e.g. component labels) go into metadata only.
     # "units" (list) on a component dim gives per-label units; exposed in to_xarray attrs.
 
+    def __post_init__(self):
+        self.kind = DataKind(self.kind)
+        if self.shape is not None:
+            self.shape = tuple(self.shape)
+        shape = self.shape or ()
+        ndim = {DataKind.SCALAR: 0, DataKind.TRACE: 1, DataKind.IMAGE: 2}[self.kind]
+        if len(shape) != ndim:
+            raise ValueError(
+                f"readout '{self.name}': kind '{self.kind}' needs a {ndim}-D shape, got shape={self.shape}"
+            )
+
+        # contains as a list of labels on a trace/image is shorthand for a component dim
+        if isinstance(self.contains, list) and self.trailing_dims is None and shape:
+            self.trailing_dims = [{"name": "component", "values": list(self.contains)}]
+        if self.trailing_dims is None:
+            return
+
+        if len(self.trailing_dims) > len(shape):
+            raise ValueError(
+                f"readout '{self.name}': {len(self.trailing_dims)} trailing_dims for shape {self.shape}"
+            )
+        dims = []
+        for i, td in enumerate(self.trailing_dims):
+            if not isinstance(td, dict) or not isinstance(td.get("name"), str):
+                raise ValueError(f"readout '{self.name}': each trailing_dims entry needs a string 'name'")
+            td = dict(td)
+            if td.get("values") is not None:
+                arr = np.asarray(td["values"])
+                if arr.ndim != 1 or len(arr) != shape[i]:
+                    raise ValueError(
+                        f"readout '{self.name}': trailing dim '{td['name']}' has values of shape "
+                        f"{arr.shape}, expected ({shape[i]},)"
+                    )
+                if arr.dtype.kind in "US":
+                    td["values"] = arr.tolist()
+            if td.get("units") is not None:
+                if not isinstance(td["units"], (list, tuple)) or len(td["units"]) != shape[i]:
+                    raise ValueError(
+                        f"readout '{self.name}': trailing dim '{td['name']}' needs {shape[i]} units"
+                    )
+                td["units"] = list(td["units"])
+            dims.append(td)
+        names = [td["name"] for td in dims]
+        if len(set(names)) != len(names):
+            raise ValueError(f"readout '{self.name}': duplicate trailing dim names {names}")
+        self.trailing_dims = dims
+
 
 def _keep_in_meta(k: str, v) -> bool:
     """Return True if a trailing_dim key-value pair should be stored in metadata.yaml."""
@@ -101,6 +148,37 @@ def _keep_in_meta(k: str, v) -> bool:
     if isinstance(v, (list, tuple)):
         return bool(v) and isinstance(v[0], str)
     return False  # numpy array → goes in zarr
+
+
+def _meta_trailing_dims(spec: ReadoutSpecs) -> list[dict]:
+    """trailing_dims as stored in metadata: numeric value arrays are left out (they live in zarr)."""
+    return [{k: v for k, v in td.items() if _keep_in_meta(k, v)} for td in spec.trailing_dims or []]
+
+
+def _readout_manifest(spec: ReadoutSpecs) -> dict:
+    return {
+        "name": spec.name,
+        "kind": str(spec.kind),
+        "shape": list(spec.shape or ()),
+        "unit": spec.unit,
+        "contains": spec.contains,
+        "trailing_dims": _meta_trailing_dims(spec),
+    }
+
+
+def _write_trailing_coords(group, spec: ReadoutSpecs, overwrite: bool) -> None:
+    """Store numeric trailing-dim coordinates as "{readout}.{dim}" arrays; string labels stay in metadata."""
+    for td in spec.trailing_dims or []:
+        values = td.get("values")
+        if values is None:
+            continue
+        values = np.asarray(values)
+        if not np.issubdtype(values.dtype, np.number):
+            continue
+        arr = group.create_array(
+            name=f"{spec.name}.{td['name']}", shape=values.shape, dtype=values.dtype, overwrite=overwrite
+        )
+        arr[:] = values
 
 
 @dataclass(slots=True)
@@ -138,36 +216,16 @@ class MeasurementSchema:
             {"name": c.name, "dim": d, "unit": c.unit}
             for d, ax in enumerate(self.control) for c in ax.controls
         ]
-        readouts = [
-            {
-                "name": r.name,
-                "kind": str(r.kind),
-                "shape": list(r.shape or ()),
-                "unit": r.unit,
-                "contains": r.contains,
-                "trailing_dims": self.meta["readout"][r.name].get("trailing_dims") or [],
-            }
-            for r in self.readout
-        ]
+        readouts = [_readout_manifest(r) for r in self.readout]
         return {"version": 2, "kind": "sweep", "axes": axes, "readouts": readouts}
 
     def __post_init__(self):
-        # Auto-promote contains-as-list to trailing_dims when trailing_dims not set.
-        for r in self.readout:
-            if isinstance(r.contains, list) and r.trailing_dims is None:
-                r.trailing_dims = [{"name": "component", "values": r.contains}]
-
         readout_meta = {}
         for r in self.readout:
             specs = asdict(r)
             specs.pop("name")
-            # Strip numeric arrays from trailing_dims — they go in zarr, not yaml.
-            # Keep string lists (e.g. component labels) and "units" lists in yaml.
-            if specs.get("trailing_dims"):
-                specs["trailing_dims"] = [
-                    {k: v for k, v in td.items() if _keep_in_meta(k, v)}
-                    for td in specs["trailing_dims"]
-                ]
+            if r.trailing_dims:
+                specs["trailing_dims"] = _meta_trailing_dims(r)
             readout_meta[r.name] = specs
 
         self.meta = {
@@ -347,23 +405,7 @@ class ZarrWriter:
                 overwrite=self.overwrite,
             )
 
-            # Write trailing coord arrays as "{readout_name}.{dim_name}"
-            if readout.trailing_dims:
-                for td in readout.trailing_dims:
-                    values = td.get("values")
-                    if values is None:
-                        continue
-                    values = np.asarray(values)
-                    if not np.issubdtype(values.dtype, np.number):
-                        continue  # string labels go in metadata only
-                    coord_name = f"{readout.name}.{td['name']}"
-                    coord_arr = self.vault.create_array(
-                        name=coord_name,
-                        shape=values.shape,
-                        dtype=values.dtype,
-                        overwrite=self.overwrite,
-                    )
-                    coord_arr[:] = values
+            _write_trailing_coords(self.vault, readout, self.overwrite)
 
 
     def _get_chunk_shape(self) -> tuple[int, ...]:
@@ -618,10 +660,14 @@ class StreamingWriter:
 
     Args:
         root:        directory for vault.zarr and metadata.yaml
-        readouts:    dict mapping readout name to its trailing shape.
-                     Use an empty tuple () for scalars, (N,) for traces,
-                     (H, W) for images.
-                     Example: {"lockin_X": (), "S21": (1601,), "frame": (480, 640)}
+        readouts:    dict mapping readout name to either its trailing shape
+                     (() for scalars, (N,) for traces, (H, W) for images) or a
+                     ReadoutSpecs, which also records unit, contains and
+                     trailing_dims (see ReadoutSpecs). A ReadoutSpecs name must
+                     match its key. Both forms can be mixed.
+                     Example: {"lockin_X": (), "S21": ReadoutSpecs("S21", DataKind.TRACE,
+                               shape=(1601,), unit="dBm",
+                               trailing_dims=[{"name": "freq", "unit": "Hz", "values": freqs}])}
         chunk_size:  number of samples per chunk along the time axis.
                      Also the buffer size — flush() is called automatically
                      once this many samples have been buffered.
@@ -631,7 +677,7 @@ class StreamingWriter:
     """
 
     root: str | Path
-    readouts: dict[str, tuple]
+    readouts: dict[str, tuple | ReadoutSpecs]
     chunk_size: int = 256
     dtype: str = "float32"
     tags: list[str] = field(default_factory=list)
@@ -640,8 +686,17 @@ class StreamingWriter:
     _count: int = field(init=False, default=0)
     _buf_time: list = field(init=False, default_factory=list)
     _buf_data: dict = field(init=False, default_factory=dict)
+    _trailing: dict = field(init=False, default_factory=dict)
 
     def __post_init__(self):
+        for name, r in self.readouts.items():
+            if isinstance(r, ReadoutSpecs) and r.name != name:
+                raise ValueError(f"readouts key '{name}' does not match ReadoutSpecs name '{r.name}'")
+        self._trailing = {
+            name: tuple(r.shape or ()) if isinstance(r, ReadoutSpecs) else tuple(r)
+            for name, r in self.readouts.items()
+        }
+
         self.root = Path(self.root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.vault = zarr.group(str(self.root / "vault.zarr"))
@@ -656,7 +711,8 @@ class StreamingWriter:
             overwrite=self.overwrite,
         )
 
-        for name, trailing in self.readouts.items():
+        manifest = []
+        for name, trailing in self._trailing.items():
             self.vault.create_array(
                 name=name,
                 shape=(0,) + trailing,
@@ -664,17 +720,16 @@ class StreamingWriter:
                 dtype=self.dtype,
                 overwrite=self.overwrite,
             )
-
-        self.vault.attrs["zarro"] = {
-            "version": 2,
-            "kind": "monitor",
-            "axes": [],
-            "readouts": [
-                {"name": name, "kind": ("scalar", "trace", "image")[min(len(trailing), 2)],
-                 "shape": list(trailing), "unit": None, "contains": None, "trailing_dims": []}
-                for name, trailing in self.readouts.items()
-            ],
-        }
+            spec = self.readouts[name]
+            if isinstance(spec, ReadoutSpecs):
+                _write_trailing_coords(self.vault, spec, self.overwrite)
+                manifest.append(_readout_manifest(spec))
+            else:
+                manifest.append({
+                    "name": name, "kind": ("scalar", "trace", "image")[min(len(trailing), 2)],
+                    "shape": list(trailing), "unit": None, "contains": None, "trailing_dims": [],
+                })
+        self.vault.attrs["zarro"] = {"version": 2, "kind": "monitor", "axes": [], "readouts": manifest}
 
     def append(self, data: dict, timestamp: float = None):
         """Buffer one sample. Flushes to disk automatically when chunk_size is reached.
@@ -727,7 +782,7 @@ class StreamingWriter:
             "date":     datetime.now().isoformat(),
             "count":    self._count,
             "tags":     self.tags,
-            "readouts": {k: list(v) for k, v in self.readouts.items()},
+            "readouts": {k: list(v) for k, v in self._trailing.items()},
         }
         if meta:
             metadata |= meta

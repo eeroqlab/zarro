@@ -53,6 +53,7 @@ A comprehensive guide to the `zarro` package for structured experimental data sa
     - [Reading streaming data](#125-reading-streaming-data)
     - [Mixed readout shapes](#126-mixed-readout-shapes)
     - [Manual timestamps](#127-manual-timestamps)
+    - [Readout metadata (ReadoutSpecs)](#128-readout-metadata-readoutspecs)
 13. [Sharding and Performance](#13-sharding-and-performance)
 14. [API Reference](#14-api-reference)
 15. [Version Management](#15-version-management)
@@ -236,7 +237,13 @@ frame = ReadoutSpecs(
 | `values` | `list` or `ndarray` | Coordinate values. String lists go in `metadata.yaml`; numeric arrays are stored as `{readout}.{dim_name}` in vault.zarr |
 | `units` | `list[str]` | Per-label units for a component dimension (one entry per value) |
 
-**Component shorthand** — passing `contains` as a list automatically creates the equivalent `trailing_dims` entry at schema build time, so the two forms below are identical:
+**Validation** — `ReadoutSpecs` checks itself when it is created and raises `ValueError` for:
+- a `kind`/`shape` mismatch (SCALAR needs no shape, TRACE a 1-D shape, IMAGE a 2-D shape)
+- more `trailing_dims` entries than trailing dimensions (fewer is allowed; the rest get generic names)
+- a `values` array whose length differs from its dimension, or a `units` list of the wrong length
+- a `trailing_dims` entry without a string `name`, or duplicate names
+
+**Component shorthand** — passing `contains` as a list on a TRACE or IMAGE readout automatically creates the equivalent `trailing_dims` entry as soon as the `ReadoutSpecs` is built (its length must match the first trailing dimension), so the two forms below are identical:
 
 ```python
 # shorthand (old style — still supported)
@@ -563,7 +570,7 @@ writer.write_metadata()
 Besides the metadata above, every writer stores a small **manifest** in the vault's group attributes (`vault.zarr/zarr.json` → `attributes["zarro"]`). It is the one place `open_vault` reads the run's structure from, so it needs no format guessing.
 
 - `ZarrWriter` writes it at initialization (and again in `write_metadata()`), so a run can be opened mid-sweep even before `metadata.yaml` or the final attributes exist.
-- `StreamingWriter` writes it at init.
+- `StreamingWriter` writes it at init; readouts given as a `ReadoutSpecs` ([§12.8](#128-readout-metadata-readoutspecs)) carry their unit, `contains` and `trailing_dims` in it too.
 - `write_metadata()` / `close()` / `dump()` merge into the attributes, so the manifest is never overwritten.
 
 ```json
@@ -862,7 +869,7 @@ x_values = run.values("x")   # shape (n_samples,), always fully written
 
 da = run.to_xarray("x")      # dims ("time",); trace/image readouts add "sample" / "row","col"
 da.coords["time"]            # raw Unix seconds, attrs["units"] == "s (unix epoch)"
-da.sel(time=t0, method="nearest")
+da.sel(time=run.time[0], method="nearest")
 ```
 
 The vault can be opened before the writer calls `close()`.
@@ -1166,6 +1173,43 @@ writer.close()
 
 If `timestamp` is omitted, `datetime.now().timestamp()` is used.
 
+### 12.8 Readout metadata (ReadoutSpecs)
+
+A plain shape tuple only tells the writer the array shape.  To also record units, component labels or trailing-axis coordinates (for example the frequency axis of a VNA trace), pass a `ReadoutSpecs` instead.  Tuples and `ReadoutSpecs` can be mixed in one dict, and the dict key must equal the spec's `name`:
+
+```python
+from zarro import StreamingWriter, ReadoutSpecs, DataKind, open_vault
+import numpy as np
+
+freqs = np.linspace(4e9, 8e9, 1601)
+writer = StreamingWriter(
+    root="./data/vna_monitor",
+    readouts={
+        "temperature": ReadoutSpecs("temperature", DataKind.SCALAR, unit="K"),
+        "S21": ReadoutSpecs(
+            "S21", DataKind.TRACE, shape=(1601,), unit="dBm",
+            trailing_dims=[{"name": "freq", "unit": "Hz", "values": freqs}],
+        ),
+        "lockin_xy": ReadoutSpecs("lockin_xy", DataKind.TRACE, shape=(2,), unit="V",
+                                  contains=["X", "Y"]),
+        "raw": (16,),                       # a plain shape tuple still works
+    },
+    chunk_size=64,
+    overwrite=True,
+)
+writer.append({"temperature": 4.2, "S21": np.zeros(1601),
+               "lockin_xy": [1.0, 0.1], "raw": np.zeros(16)})
+writer.close()
+
+run = open_vault("./data/vna_monitor")
+run.readouts["S21"].unit                  # "dBm"
+run.trailing_coords["S21"]["freq"]        # the freqs array
+da = run.to_xarray("S21")                 # dims ("time", "freq"), da.attrs["units"] == "dBm"
+run.values("lockin_xy", component="X")    # shape (n_samples,)
+```
+
+The same rules as `ZarrWriter` apply ([§3.3](#33-readoutspecs)): a `contains` list becomes a `component` dimension, numeric `trailing_dims` values are stored as `{readout}.{dim}` arrays in `vault.zarr`, and string labels and per-label `units` are kept in the manifest.  The manifest is written when the writer is created, so units and labels are available even while the run is still open.  Shape and kind are validated when the `ReadoutSpecs` is created; a `ReadoutSpecs` whose name differs from its dict key raises `ValueError`.  Plain tuples are not validated beyond their shape and are inferred as scalar / trace / image by length.
+
 ---
 
 ## 13. Sharding and Performance
@@ -1335,7 +1379,7 @@ eid.get_folders()         → list[Path]
 ```python
 StreamingWriter(
     root: str | Path,
-    readouts: dict[str, tuple],   # name -> trailing shape, e.g. {"x": (), "S21": (1601,)}
+    readouts: dict[str, tuple | ReadoutSpecs],   # name -> trailing shape, or a ReadoutSpecs (name must match the key)
     chunk_size: int = 256,
     dtype: str = "float32",
     tags: list[str] = [],

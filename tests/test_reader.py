@@ -1372,3 +1372,90 @@ class TestToXarrayMonitor:
         sw.flush()
         da = Vault(tmp_path).to_xarray("x")
         assert da.dims == ("time",) and da.shape == (1,)
+
+
+# ===========================================================================
+# TestMonitorReadoutSpecs — StreamingWriter(ReadoutSpecs) seen through Vault
+# ===========================================================================
+
+MON_FREQ = np.linspace(4e9, 8e9, N_T)
+
+
+def make_spec_monitor(tmp_path, n=3, close=True):
+    specs = {
+        "temp": ReadoutSpecs("temp", DataKind.SCALAR, unit="K"),
+        "S21": ReadoutSpecs("S21", DataKind.TRACE, shape=(N_T,), unit="dBm",
+                            trailing_dims=[{"name": "freq", "unit": "Hz", "values": MON_FREQ}]),
+        "lockin": ReadoutSpecs("lockin", DataKind.TRACE, shape=(2,), unit="V", contains=["X", "Y"]),
+        "res": ReadoutSpecs("res", DataKind.IMAGE, shape=(3, N_T), trailing_dims=[
+            {"name": "component", "values": ["fpts", "mag", "phase"], "units": ["Hz", "dBm", "deg"]},
+            {"name": "freq", "unit": "Hz", "values": MON_FREQ}]),
+        "raw": (2,),
+    }
+    sw = StreamingWriter(root=tmp_path, readouts=specs, chunk_size=2)
+    rng = np.random.default_rng(3)
+    data = {k: rng.random((n,) + tuple(np.atleast_1d(s.shape if isinstance(s, ReadoutSpecs) else s)), dtype=np.float32)
+            if (s.shape if isinstance(s, ReadoutSpecs) else s) else rng.random(n, dtype=np.float32)
+            for k, s in specs.items()}
+    for i in range(n):
+        sw.append({k: v[i] for k, v in data.items()}, timestamp=100.0 + i)
+    sw.close() if close else sw.flush()
+    return data
+
+
+class TestMonitorReadoutSpecs:
+
+    def test_unit_and_kind_reported(self, tmp_path):
+        make_spec_monitor(tmp_path)
+        v = Vault(tmp_path)
+        assert v.kind == "monitor"
+        assert v.readouts["temp"].unit == "K" and v.readouts["temp"].kind == "scalar"
+        assert v.readouts["S21"].unit == "dBm" and v.readouts["S21"].shape == (N_T,)
+        assert v.readouts["raw"].unit is None            # tuple form unchanged
+
+    def test_available_before_close(self, tmp_path):
+        make_spec_monitor(tmp_path, close=False)
+        v = Vault(tmp_path)                              # flushed, never closed
+        assert v.readouts["S21"].unit == "dBm"
+        assert v.readouts["S21"].trailing_dims == ("freq",)
+
+    def test_trailing_coords_and_units(self, tmp_path):
+        make_spec_monitor(tmp_path)
+        v = Vault(tmp_path)
+        np.testing.assert_array_equal(v.trailing_coords["S21"]["freq"], MON_FREQ)
+        assert v.trailing_units["res"]["component"] == ["Hz", "dBm", "deg"]
+
+    def test_component_read_via_contains_promotion(self, tmp_path):
+        data = make_spec_monitor(tmp_path)
+        v = Vault(tmp_path)
+        assert v.readouts["lockin"].trailing_dims == ("component",)
+        np.testing.assert_array_almost_equal(v.read("lockin", component="Y"), data["lockin"][:, 1])
+        np.testing.assert_array_almost_equal(v.values("res", component="mag"), data["res"][:, 1, :])
+
+    def test_to_xarray_labels_and_units(self, tmp_path):
+        data = make_spec_monitor(tmp_path)
+        v = Vault(tmp_path)
+        da = v.to_xarray("S21")
+        assert da.dims == ("time", "freq") and da.attrs["units"] == "dBm"
+        np.testing.assert_array_equal(da.coords["freq"].values, MON_FREQ)
+        res = v.to_xarray("res")
+        assert res.dims == ("time", "component", "freq")
+        assert res.attrs["component_units"] == {"fpts": "Hz", "mag": "dBm", "phase": "deg"}
+        assert v.to_xarray("res", component="phase").dims == ("time", "freq")
+        np.testing.assert_array_almost_equal(v.to_xarray("temp").values, data["temp"])
+        assert v.to_xarray("raw").dims == ("time", "sample")
+
+    def test_snapshot_handles_list_contains_and_units(self, tmp_path, capsys):
+        write_full_image_layers(tmp_path)
+        strip_manifest(tmp_path)
+        v = Vault(tmp_path)
+        v.readouts["res"] = Readout("res", "image", (3, N_T), ["Hz", "dBm", "deg"], ["fpts", "mag", "phase"])
+        v.snapshot()
+        out = capsys.readouterr().out
+        assert "fpts, mag, phase" in out and "Hz, dBm, deg" in out
+
+    def test_snapshot_shows_unit(self, tmp_path, capsys):
+        make_spec_monitor(tmp_path)
+        Vault(tmp_path).snapshot()
+        out = capsys.readouterr().out
+        assert "dBm" in out and "K" in out

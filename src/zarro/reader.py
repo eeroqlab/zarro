@@ -95,6 +95,7 @@ def _infer_kind(trailing: tuple[int, ...]) -> str:
 
 def _print_table(rows, headers, title) -> None:
     print(title)
+    rows = [[", ".join(map(str, c)) if isinstance(c, (list, tuple)) and c else str(c) for c in row] for row in rows]
     widths = [max(len(str(h)), *(len(str(r[i])) for r in rows)) for i, h in enumerate(headers)]
     fmt = "  ".join(f"{{:<{w}}}" for w in widths)
     print(fmt.format(*headers))

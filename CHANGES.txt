@@ -2,6 +2,20 @@ CHANGES
 =======
 
 [2026-11-14]
+- core: StreamingWriter accepts a ReadoutSpecs per readout (mixed with plain shape tuples);
+  unit, contains and trailing_dims are recorded in the attrs["zarro"] manifest at init, numeric
+  trailing_dims values are written as "{readout}.{dim}" arrays, and the reader reports them
+  (Readout.unit, trailing_coords/trailing_units, to_xarray labels and units) for monitor runs.
+  A ReadoutSpecs name must match its dict key (ValueError). Tuple usage is unchanged.
+- core: ReadoutSpecs now validates itself at construction (ValueError): kind/shape consistency
+  (scalar (), trace 1-D, image 2-D), trailing_dims count and value/unit lengths, duplicate names.
+  The contains-list promotion moved from MeasurementSchema into ReadoutSpecs.__post_init__ and
+  applies only to trace/image readouts; string-array labels become lists; caller dicts are copied.
+  ZarrWriter, MeasurementSchema.manifest and StreamingWriter share _write_trailing_coords and
+  _readout_manifest instead of duplicating that logic.
+- reader: fix snapshot() crashing on readouts whose contains/unit is a list (plain-text table
+  now joins list cells)
+- docs: §3.3 validation rules, new §12.8 Readout metadata, §6.4 and §14 updated
 - reader: to_xarray() on monitor runs now has a leading "time" dimension whose coordinate is
   the raw Unix timestamps (attrs["units"] = "s (unix epoch)"); grid logic factored into
   Vault._grid_dims_and_coords()
