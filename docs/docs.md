@@ -933,33 +933,59 @@ all_mag = z["S21_mag"][:]     # shape (20, 1601)
 `ExperimentID` manages a directory of sequentially numbered experiment folders:
 
 ```python
+from pathlib import Path
 from zarro import ExperimentID
 
-eid = ExperimentID(root="./experiments")
+root = Path("./experiments_demo")
+for name in ["0001", "0003_fridge", "notes", "2026_backup"]:
+    (root / name).mkdir(parents=True, exist_ok=True)
+for name in ["0001", "0003_fridge"]:
+    (root / name / "vault.zarr").mkdir()     # a real run holds vault.zarr, data.npz or metadata.yaml
 
-print(eid.current_id())   # e.g. 3
+eid = ExperimentID(root)
+
+print(eid.current_id())   # 3 — "notes" and "2026_backup" are not runs, the gap at 0002 is fine
 print(eid.next_id())      # 4
-print(eid.next_dir())     # PosixPath('./experiments/0004')
-print(eid.current_dir())  # PosixPath('./experiments/0003')
+print(eid.next_dir())     # PosixPath('experiments_demo/0004')
+print(eid.current_dir())  # PosixPath('experiments_demo/0003')
 
 # Look up an existing folder by integer ID or string name
-print(eid.get_dir_name(2))            # PosixPath('./experiments/0002')
-print(eid.get_dir_name("special_run")) # PosixPath('./experiments/special_run')
+print(eid.get_dir_name(2))             # PosixPath('experiments_demo/0002')
+print(eid.get_dir_name("special_run")) # PosixPath('experiments_demo/special_run')
 ```
 
 Typical usage in a measurement script:
 
 ```python
 eid = ExperimentID(root="./experiments")
-run_dir = eid.next_dir()
+run_id = eid.next_id()
+run_dir = eid.get_dir_name(run_id)
 
 writer = ZarrWriter(root=run_dir, schema=schema,
                     overwrite=False, initialize_arrays=True)
 # ... run sweep ...
-writer.write_metadata(meta={"id": eid.next_id()})
+writer.write_metadata(meta={"id": run_id})
 ```
 
-Folder names use zero-padded 4-digit integers (`0001`, `0002`, …) so they sort correctly in file explorers.
+Folder names use zero-padded integers of at least four digits (`0001`, `0002`, …, `9999`, `10000`) so they sort correctly in file explorers.
+
+### What counts as a run folder
+
+`current_id()` is the largest id among **run folders**, or `0` if there are none.  A run folder is a subfolder that
+
+- is named exactly `NNNN` or `NNNN_suffix` (four or more digits, no extra leading zeros), e.g. `0007` or `0007_fridge`, **and**
+- contains `vault.zarr` (a directory), `data.npz` or `metadata.yaml`, i.e. output from `ZarrWriter`, `NpzWriter` or `StreamingWriter`.
+
+Everything else is ignored: `notes`, `2026_backup`, a file called `0009`, hidden folders.  The result does not depend on the order the filesystem lists folders, and ids are compared as numbers (`10000` is larger than `9999`).
+
+Consequences:
+
+- **Gaps are fine.** If `0002` and `0003` were deleted, the next id after `0004` is still `5`.
+- **Deleting the newest run frees its id.** After removing `0003` from `0001..0003`, `next_id()` is `3` again; keep that in mind before archiving recent runs elsewhere.
+- **A numbered folder without output is not a run.** An empty `0002` (a manual `mkdir`, or a crash before the writer started) does not use up its id; the next run reuses it.  A run that got as far as creating `vault.zarr` keeps its id.
+- **Two processes can still pick the same id** if they call `next_dir()` at the same moment, because nothing reserves the folder until a writer creates it.
+
+`open_vault` resolves a bare id such as `open_vault("./experiments/0007")` with the same rule ([§14](#open_vaultpath)), so both always agree on what a run folder is.
 
 ---
 
@@ -1394,12 +1420,12 @@ writer.write_metadata(meta: dict = None)
 ```python
 ExperimentID(root: str | Path)
 
-eid.current_id()          → int
 eid.next_id()             → int
+eid.current_id()          → int    # largest id among run folders, 0 if none (see §9)
 eid.next_dir()            → Path   # e.g. ./data/0004
 eid.current_dir()         → Path
-eid.get_dir_name(id)      → Path   # int or str
-eid.get_folders()         → list[Path]
+eid.get_dir_name(id)      → Path   # int -> zero-padded (at least 4 digits), str -> as given
+eid.get_folders()         → list[Path]   # all subfolders, listing order unspecified
 ```
 
 ### StreamingWriter
@@ -1446,8 +1472,10 @@ from zarro.reader import Axis, Readout
 #### `open_vault(path)`
 
 Returns `Vault(path)`.  When the exact path does not exist and its final
-component is a 4-digit experiment ID (e.g. `"0007"`), the parent directory is
-searched for a folder whose name starts with that ID (e.g. `"0007_blabla"`).
+component is an experiment ID of four or more digits (e.g. `"0007"`), the parent
+directory is searched for a run folder with that id, named `0007` or
+`0007_suffix` and containing `vault.zarr`, `data.npz` or `metadata.yaml`
+(see [§9](#what-counts-as-a-run-folder)); numbered folders without output are ignored.
 Raises `VaultError` if zero or more than one match is found.
 
 #### `Vault(path, *, control=None, readouts=None)`

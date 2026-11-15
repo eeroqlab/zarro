@@ -2,6 +2,21 @@ CHANGES
 =======
 
 [2026-11-14]
+- core: ExperimentID.current_id() no longer depends on directory listing order or on unrelated
+  folders. It is now the largest id among run folders, 0 if none (no more len(folders) floor).
+  Fixes: ValueError on a non-numeric folder listed last, "2026_backup" giving id 2026, and an
+  unsorted listing returning an existing id (ContainsArrayError at run start).
+  * run folder = subfolder named NNNN or NNNN_suffix (four or more digits, no extra leading
+    zeros) containing vault.zarr (dir), data.npz or metadata.yaml, so NpzWriter runs count;
+    ids are compared numerically (10000 > 9999) and ids above 9999 work
+  * a numbered folder without output is not a run, so its id is reused
+  * candidates are checked from the highest id down, so typically one or two stats on a NAS
+  * next_id/next_dir/current_dir/get_dir_name/get_folders keep their signatures
+- core/reader: new shared helper zarro/_runs.py; open_vault(".../0007") uses the same rule
+  (previously any folder named 0007 or 0007_*, four digits only), so numbered folders without
+  output such as "2026_backup" no longer match and ids of five or more digits resolve
+- docs: §9 documents the run-folder rule and its consequences; fixed the "typical usage" example,
+  which recorded next_id() after the folder had been created (off by one); §14 updated
 - core: ZarrWriter stores control-variable coordinate arrays as float64 regardless of the
   writer's dtype (readout data arrays keep dtype, default float32). float32 merged distinct
   GHz-scale sweep points (5.123456789e9 and 5.123456790e9 were stored as the same value).

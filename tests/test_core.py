@@ -20,6 +20,7 @@ from zarro.core import (
     DataKind,
     MeasurementSchema,
     NpzWriter,
+    ExperimentID,
     ReadoutSpecs,
     StreamingWriter,
     WriteType,
@@ -939,3 +940,165 @@ class TestCoordinateDtype:
         assert z["_time"].dtype == np.float64 and z["x"].dtype == np.float32
         assert z["_time"][0] == 1.7e9 + 0.123456
         assert sorted(k for k in z.array_keys()) == ["_time", "x"]
+
+
+# ===========================================================================
+# ExperimentID
+# ===========================================================================
+
+def _run(root, name, artifact="vault.zarr"):
+    """A run folder: numbered directory holding zarro output."""
+    d = root / name
+    d.mkdir(parents=True, exist_ok=True)
+    if artifact == "vault.zarr":
+        (d / artifact).mkdir()
+    elif artifact:
+        (d / artifact).write_text("")
+    return d
+
+
+def _listing(monkeypatch, order):
+    """Force the directory listing order (the filesystem's order is unspecified)."""
+    from zarro import core
+    real = core.list_dirs
+    monkeypatch.setattr(core, "list_dirs", lambda root: order(real(root)))
+
+
+class TestExperimentID:
+
+    def test_empty_root(self, tmp_path):
+        eid = ExperimentID(tmp_path / "new")          # also creates the root
+        assert eid.current_id() == 0 and eid.next_id() == 1
+        assert eid.next_dir() == tmp_path / "new" / "0001"
+        assert eid.current_dir() == tmp_path / "new" / "0000"
+
+    def test_normal_numbering(self, tmp_path):
+        for n in ("0001", "0002", "0003"):
+            _run(tmp_path, n)
+        eid = ExperimentID(tmp_path)
+        assert eid.current_id() == 3 and eid.next_id() == 4
+        assert eid.next_dir() == tmp_path / "0004" and eid.current_dir() == tmp_path / "0003"
+
+    def test_non_numeric_folders_ignored(self, tmp_path, monkeypatch):
+        _run(tmp_path, "0001"); _run(tmp_path, "0002")
+        for name in ("notes", "zzz", ".git", "__pycache__", "note"):
+            (tmp_path / name).mkdir()
+        for order in (sorted, lambda d: sorted(d, reverse=True)):   # a non-numeric folder listed last
+            _listing(monkeypatch, order)
+            assert ExperimentID(tmp_path).current_id() == 2
+
+    def test_year_like_folder_is_not_a_run(self, tmp_path):
+        _run(tmp_path, "0004")
+        (tmp_path / "2026_backup").mkdir()
+        (tmp_path / "20260101").mkdir()
+        assert ExperimentID(tmp_path).next_id() == 5
+
+    def test_year_like_folder_with_a_vault_is_a_run(self, tmp_path):
+        _run(tmp_path, "0004"); _run(tmp_path, "2026_backup")
+        assert ExperimentID(tmp_path).current_id() == 2026
+
+    def test_gaps_use_the_largest_id_not_the_count(self, tmp_path):
+        _run(tmp_path, "0001"); _run(tmp_path, "0004")        # 0002, 0003 were deleted
+        for i in range(5):
+            (tmp_path / f"other{i}").mkdir()                   # unrelated folders must not raise the floor
+        assert ExperimentID(tmp_path).current_id() == 4
+
+    def test_deleting_the_newest_run_frees_its_id(self, tmp_path):
+        for n in ("0001", "0002", "0003"):
+            _run(tmp_path, n)
+        import shutil
+        shutil.rmtree(tmp_path / "0003")
+        assert ExperimentID(tmp_path).next_id() == 3
+
+    @pytest.mark.parametrize("name, order", [
+        ("ascending", sorted),
+        ("descending", lambda d: sorted(d, reverse=True)),
+        ("shuffled", lambda d: sorted(d, key=lambda p: hash(p.name) % 7)),
+    ])
+    def test_independent_of_listing_order(self, tmp_path, monkeypatch, name, order):
+        for n in ("0001", "0003"):
+            _run(tmp_path, n)
+        _listing(monkeypatch, order)
+        eid = ExperimentID(tmp_path)
+        assert eid.current_id() == 3 and eid.next_dir() == tmp_path / "0004"
+
+    def test_unsorted_listing_with_get_folders_patched(self, tmp_path, monkeypatch):
+        for n in ("0001", "0003"):
+            _run(tmp_path, n)
+        monkeypatch.setattr(ExperimentID, "get_folders", lambda self: [tmp_path / "0003", tmp_path / "0001"])
+        assert ExperimentID(tmp_path).next_id() == 4
+
+    def test_suffixed_folders(self, tmp_path):
+        _run(tmp_path, "0001"); _run(tmp_path, "0007_fridge")
+        eid = ExperimentID(tmp_path)
+        assert eid.current_id() == 7 and eid.next_dir() == tmp_path / "0008"
+
+    def test_same_id_with_and_without_suffix(self, tmp_path):
+        _run(tmp_path, "0007"); _run(tmp_path, "0007_fridge")
+        assert ExperimentID(tmp_path).current_id() == 7
+
+    def test_numbered_folder_without_output_is_not_a_run(self, tmp_path):
+        _run(tmp_path, "0001")
+        (tmp_path / "0002").mkdir()                            # e.g. a manual mkdir or a crash before the writer
+        eid = ExperimentID(tmp_path)
+        assert eid.current_id() == 1 and eid.next_dir() == tmp_path / "0002"   # id is reused
+
+    def test_numbered_folder_with_only_a_vault_counts(self, tmp_path):
+        """A run that failed after the writer created vault.zarr but before any data keeps its id."""
+        _run(tmp_path, "0001"); _run(tmp_path, "0002")
+        assert ExperimentID(tmp_path).next_id() == 3
+
+    @pytest.mark.parametrize("artifact", ["data.npz", "metadata.yaml"])
+    def test_npz_and_metadata_only_runs_count(self, tmp_path, artifact):
+        _run(tmp_path, "0001"); _run(tmp_path, "0002", artifact=artifact)
+        assert ExperimentID(tmp_path).current_id() == 2
+
+    def test_real_npz_writer_run_counts(self, tmp_path):
+        eid = ExperimentID(tmp_path)
+        schema = MeasurementSchema(control=[AxisSpecs([ControlVar("a", np.arange(2.0))])],
+                                   readout=[ReadoutSpecs("x", DataKind.SCALAR)])
+        NpzWriter(root=eid.next_dir(), schema=schema, overwrite=False).write({"x": np.arange(2.0)})
+        assert eid.current_id() == 1 and eid.next_dir() == tmp_path / "0002"
+
+    def test_vault_zarr_must_be_a_directory(self, tmp_path):
+        d = tmp_path / "0001"; d.mkdir()
+        (d / "vault.zarr").write_text("")                      # a file, not a zarr group
+        assert ExperimentID(tmp_path).current_id() == 0
+
+    def test_plain_file_with_a_run_like_name_ignored(self, tmp_path):
+        _run(tmp_path, "0001")
+        (tmp_path / "0009").write_text("")
+        assert ExperimentID(tmp_path).current_id() == 1
+
+    def test_ids_above_9999_compare_numerically(self, tmp_path):
+        for n in ("9999", "10000", "10001_x"):
+            _run(tmp_path, n)
+        eid = ExperimentID(tmp_path)
+        assert eid.current_id() == 10001
+        assert eid.next_dir() == tmp_path / "10002"
+
+    def test_rolls_over_after_9999(self, tmp_path):
+        _run(tmp_path, "9999")
+        assert ExperimentID(tmp_path).next_dir() == tmp_path / "10000"
+
+    def test_non_canonical_padding_ignored(self, tmp_path):
+        _run(tmp_path, "0003"); _run(tmp_path, "00007")
+        assert ExperimentID(tmp_path).current_id() == 3
+
+    def test_get_dir_name_unchanged(self, tmp_path):
+        eid = ExperimentID(tmp_path)
+        assert eid.get_dir_name(2) == tmp_path / "0002"
+        assert eid.get_dir_name("special_run") == tmp_path / "special_run"
+        assert eid.get_dir_name(12345) == tmp_path / "12345"
+
+    def test_get_folders_lists_all_subfolders(self, tmp_path):
+        _run(tmp_path, "0001"); (tmp_path / "notes").mkdir(); (tmp_path / "f.txt").write_text("")
+        assert sorted(p.name for p in ExperimentID(tmp_path).get_folders()) == ["0001", "notes"]
+
+    def test_zarr_writer_round_trip_numbering(self, tmp_path):
+        eid = ExperimentID(tmp_path)
+        schema = MeasurementSchema(control=[AxisSpecs([ControlVar("a", np.arange(2.0))])],
+                                   readout=[ReadoutSpecs("x", DataKind.SCALAR)])
+        for expected in (1, 2, 3):
+            assert eid.next_id() == expected
+            ZarrWriter(root=eid.next_dir(), schema=schema, initialize_arrays=True)

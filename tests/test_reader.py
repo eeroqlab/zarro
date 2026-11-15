@@ -870,10 +870,42 @@ class TestErrors:
             open_vault(tmp_path / "0099")
 
     def test_open_vault_id_ambiguous_raises(self, tmp_path):
-        (tmp_path / "0007_foo").mkdir()
-        (tmp_path / "0007_bar").mkdir()
-        with pytest.raises(VaultError, match="ambiguous"):
+        for name in ("0007_foo", "0007_bar"):
+            (tmp_path / name / "vault.zarr").mkdir(parents=True)
+        with pytest.raises(VaultError, match="ambiguous experiment ID '0007'"):
             open_vault(tmp_path / "0007")
+
+    def test_open_vault_id_ignores_numbered_folders_without_a_run(self, tmp_path):
+        """Only folders holding zarro output count as runs; a year-like backup does not."""
+        (tmp_path / "2026_backup").mkdir()
+        (tmp_path / "0007_old").mkdir()                       # empty: not a run
+        folder = tmp_path / "0007_real"
+        folder.mkdir()
+        ZarrWriter(root=folder, schema=make_2d_schema(), overwrite=True, initialize_arrays=True).write_metadata()
+        assert open_vault(tmp_path / "0007").path == folder
+        with pytest.raises(VaultError, match="no directory matching '2026\\*'"):
+            open_vault(tmp_path / "2026")
+
+    def test_open_vault_id_above_9999(self, tmp_path):
+        folder = tmp_path / "10000_long"
+        folder.mkdir()
+        ZarrWriter(root=folder, schema=make_2d_schema(), overwrite=True, initialize_arrays=True).write_metadata()
+        assert open_vault(tmp_path / "10000").path == folder
+
+    def test_open_vault_id_missing_parent_raises_vault_error(self, tmp_path):
+        with pytest.raises(VaultError, match="no directory"):
+            open_vault(tmp_path / "nowhere" / "0001")
+
+    def test_open_vault_agrees_with_experiment_id(self, tmp_path):
+        from zarro import ExperimentID
+        for name in ("0001", "0002_fridge", "notes", "2026_backup"):
+            (tmp_path / name).mkdir()
+        for name in ("0001", "0002_fridge"):
+            ZarrWriter(root=tmp_path / name, schema=make_2d_schema(), overwrite=True,
+                       initialize_arrays=True).write_metadata()
+        eid = ExperimentID(tmp_path)
+        assert eid.current_id() == 2
+        assert open_vault(tmp_path / f"{eid.current_id():04d}").path.name == "0002_fridge"
 
     def test_vault_repr(self, tmp_path):
         schema = make_2d_schema()

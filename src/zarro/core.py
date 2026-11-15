@@ -10,6 +10,8 @@ from typing import Optional
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
+from ._runs import latest_run_id, list_dirs
+
 
 def encode_value(x):
     if isinstance(x, np.ndarray):
@@ -243,16 +245,14 @@ class ExperimentID:
         self.root.mkdir(parents=True, exist_ok=True)
     
     def get_folders(self):
-        # Use a list comprehension to filter directories
-        return [x for x in self.root.iterdir() if x.is_dir()]
+        """All subfolders of root, in listing order (unspecified)."""
+        return list_dirs(self.root)
 
     def current_id(self):
-        folders = self.get_folders()
-        counter = len(folders)
-        if counter > 0:
-            counter = max(counter, int(folders[-1].name[:4]))
-        return counter
-    
+        """Largest id among run folders (``0007`` or ``0007_suffix`` holding a vault.zarr,
+        data.npz or metadata.yaml); 0 if there are none."""
+        return latest_run_id(self.get_folders())
+
     def next_id(self):
         return self.current_id() + 1   
 

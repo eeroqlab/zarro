@@ -21,12 +21,13 @@ Example
 """
 
 from dataclasses import dataclass
-import re
 from pathlib import Path
 
 import numpy as np
 import yaml
 import zarr
+
+from ._runs import ID_NAME, find_runs, list_dirs
 
 __all__ = ["Axis", "Readout", "Vault", "VaultError", "open_vault"]
 
@@ -576,29 +577,27 @@ class Vault:
 def open_vault(path: str | Path) -> Vault:
     """Open the run directory at *path* for reading.
 
-    *path* may be an exact directory path **or** a 4-digit experiment ID (as a
-    string like ``"0007"`` or an int like ``7``).  When the exact path does not
-    exist and its final component is a 4-digit ID, the parent directory is
-    searched for a folder whose name starts with that ID (e.g. ``"0007_blabla"``
-    also matches ``"0007"``).  A :class:`VaultError` is raised if no match or
-    more than one match is found.
+    *path* may be an exact directory path **or** an experiment ID of four or more
+    digits (a string like ``"0007"`` or an int like ``7``).  When the exact path
+    does not exist and its final component is such an ID, the parent directory is
+    searched for a run folder with that id: a folder named ``0007`` or
+    ``0007_suffix`` that contains ``vault.zarr``, ``data.npz`` or ``metadata.yaml``
+    (the same rule :class:`~zarro.core.ExperimentID` uses).  A :class:`VaultError`
+    is raised if no match or more than one match is found.
     """
     if isinstance(path, int):
         path = Path(f"{path:04d}")
     path = Path(path)
     if not path.exists():
         stem = path.name
-        if re.fullmatch(r"\d{4}", stem):
+        if ID_NAME.fullmatch(stem):
             parent = path.parent
-            matches = [
-                d for d in parent.iterdir()
-                if d.is_dir() and (d.name == stem or d.name.startswith(stem + "_"))
-            ]
+            matches = find_runs(list_dirs(parent), int(stem))
             if len(matches) == 1:
                 path = matches[0]
             elif len(matches) == 0:
                 raise VaultError(
-                    f"no directory matching '{stem}*' found in {parent}"
+                    f"no directory matching '{stem}*' with a vault found in {parent}"
                 )
             else:
                 names = sorted(m.name for m in matches)
