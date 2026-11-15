@@ -846,3 +846,96 @@ class TestStreamingWriterSpecs:
     def test_tuple_path_still_accepts_3d_shape(self, tmp_path):
         StreamingWriter(root=tmp_path, readouts={"vol": (2, 2, 2)})
         assert self._attrs(tmp_path)["zarro"]["readouts"][0]["kind"] == "image"
+
+
+# ===========================================================================
+# Coordinate precision: control coordinates are float64, readouts follow dtype
+# ===========================================================================
+
+GHZ = np.array([5.123456789e9, 5.123456790e9, 5.123456791e9])   # 1 Hz apart; float32 merges them
+
+
+def _ghz_writer(tmp_path, control, dtype="float32", readout=None):
+    schema = MeasurementSchema(
+        control=control,
+        readout=readout or [ReadoutSpecs("x", DataKind.SCALAR)],
+    )
+    return ZarrWriter(root=tmp_path, schema=schema, dtype=dtype, overwrite=True, initialize_arrays=True)
+
+
+def _group(tmp_path):
+    return zarr.open_group(str(tmp_path / "vault.zarr"), mode="r")
+
+
+class TestCoordinateDtype:
+
+    def test_float32_would_have_merged_the_points(self):
+        assert len(np.unique(GHZ.astype(np.float32))) == 1     # premise of the fix
+
+    def test_1d_ghz_roundtrip_distinct_float64(self, tmp_path):
+        _ghz_writer(tmp_path, [AxisSpecs([ControlVar("f", GHZ, unit="Hz")])])
+        z = _group(tmp_path)
+        assert z["f"].dtype == np.float64
+        np.testing.assert_array_equal(z["f"][:], GHZ)
+        assert np.all(np.diff(z["f"][:]) == 1.0)
+
+    def test_2d_ghz_roundtrip_distinct_float64(self, tmp_path):
+        g2 = GHZ + 1e9
+        _ghz_writer(tmp_path, [AxisSpecs([ControlVar("f1", GHZ)]), AxisSpecs([ControlVar("f2", g2)])])
+        z = _group(tmp_path)
+        for name, expected in (("f1", GHZ), ("f2", g2)):
+            assert z[name].dtype == np.float64
+            np.testing.assert_array_equal(z[name][:], expected)
+
+    @pytest.mark.parametrize("dtype", ["float32", "float64", "float16"])
+    def test_readout_follows_dtype_coords_stay_float64(self, tmp_path, dtype):
+        _ghz_writer(tmp_path, [AxisSpecs([ControlVar("f", GHZ)])], dtype=dtype)
+        z = _group(tmp_path)
+        assert z["x"].dtype == np.dtype(dtype)
+        assert z["f"].dtype == np.float64
+
+    def test_default_readout_dtype_is_float32(self, tmp_path):
+        _ghz_writer(tmp_path, [AxisSpecs([ControlVar("f", GHZ)])])
+        assert _group(tmp_path)["x"].dtype == np.float32
+
+    def test_multi_control_axis_both_float64(self, tmp_path):
+        a = ControlVar("fa", GHZ)
+        b = ControlVar("fb", GHZ + 2e9)
+        _ghz_writer(tmp_path, [AxisSpecs([a, b])])
+        z = _group(tmp_path)
+        np.testing.assert_array_equal(z["fa"][:], GHZ)
+        np.testing.assert_array_equal(z["fb"][:], GHZ + 2e9)
+        assert z["fa"].dtype == z["fb"].dtype == np.float64
+
+    def test_reverse_control_var_float64_forward_then_backward(self, tmp_path):
+        _ghz_writer(tmp_path, [AxisSpecs([ControlVar("f", GHZ, reverse=True)])])
+        z = _group(tmp_path)
+        assert z["f"].dtype == np.float64
+        np.testing.assert_array_equal(z["f"][:], np.concatenate([GHZ, GHZ[::-1]]))
+
+    def test_integer_control_values_stored_exactly_as_float64(self, tmp_path):
+        _ghz_writer(tmp_path, [AxisSpecs([ControlVar("n", np.arange(5))])])
+        z = _group(tmp_path)
+        assert z["n"].dtype == np.float64
+        np.testing.assert_array_equal(z["n"][:], np.arange(5))
+
+    def test_coordinate_arrays_are_not_sharded(self, tmp_path):
+        w = _ghz_writer(tmp_path, [AxisSpecs([ControlVar("f", GHZ)])], dtype="float16")
+        assert w.vault["f"].shards is None
+
+    def test_trailing_dims_keep_their_own_dtype(self, tmp_path):
+        spec = ReadoutSpecs("S", DataKind.TRACE, shape=(3,), trailing_dims=[
+            {"name": "freq", "values": GHZ}])
+        _ghz_writer(tmp_path, [AxisSpecs([ControlVar("a", np.arange(2.0))])], readout=[spec])
+        z = _group(tmp_path)
+        assert z["S.freq"].dtype == np.float64
+        np.testing.assert_array_equal(z["S.freq"][:], GHZ)
+
+    def test_streaming_writer_unchanged(self, tmp_path):
+        sw = StreamingWriter(root=tmp_path, readouts={"x": ()}, dtype="float32")
+        sw.append({"x": 1.0}, timestamp=1.7e9 + 0.123456)
+        sw.close()
+        z = _group(tmp_path)
+        assert z["_time"].dtype == np.float64 and z["x"].dtype == np.float32
+        assert z["_time"][0] == 1.7e9 + 0.123456
+        assert sorted(k for k in z.array_keys()) == ["_time", "x"]

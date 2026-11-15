@@ -305,7 +305,8 @@ class ZarrWriter:
             The writer uses this schema to initialize the Zarr arrays and
             optimize chunking/sharding strategies based on the writetype.
         tags (list[str]): optional list of tags to categorize or annotate the measurement.
-        dtype (str): numpy dtype string for data arrays (default "float32"). Used for array creation and shard size estimation.
+        dtype (str): numpy dtype string for readout data arrays (default "float32"). Used for array creation and shard size estimation.
+            Control-variable coordinate arrays are always stored as float64, so GHz-scale sweep points stay distinct.
         target_file_size_bytes (int): desired shard file size in bytes (default 1MB); used to compute shard shapes for trace/array data
         overwrite (bool): if True, existing data will be overwritten; otherwise, it will be preserved and verified for consistency
         initialize_arrays (bool): if True, Zarr arrays will be created at initialization based on the schema.
@@ -325,7 +326,7 @@ class ZarrWriter:
     tags: list[str] = field(default_factory=list)
 
     # Behavior
-    dtype: str = "float32"  # FIX: exposed dtype so itemsize can be used in sharding instead of hardcoded 4
+    dtype: str = "float32"  # readout data arrays only (and their shard-size estimate); coordinates are float64
     overwrite: bool = False
     initialize_arrays: bool = False  # Whether to create Zarr arrays at initialization based on the schema. If False, arrays can be created later using add_array().
     target_file_size_bytes: int = 5 * 1024 * 1024  # target ~5MB shards; adjust as needed
@@ -359,7 +360,7 @@ class ZarrWriter:
                 arr = self.vault.create_array(
                     name=var.name,
                     shape=var.values.shape,
-                    dtype=self.dtype,  # FIX: use self.dtype instead of hardcoded "float32"
+                    dtype="float64",  # float32 would merge distinct GHz-scale sweep points
                     overwrite=self.overwrite,
                 )
                 arr[:] = np.asarray(var.values)

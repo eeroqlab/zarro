@@ -1459,3 +1459,102 @@ class TestMonitorReadoutSpecs:
         Vault(tmp_path).snapshot()
         out = capsys.readouterr().out
         assert "dBm" in out and "K" in out
+
+
+# ===========================================================================
+# TestCoordinatePrecision — float64 control coordinates, float32 vaults still read
+# ===========================================================================
+
+GHZ = np.array([5.123456789e9, 5.123456790e9, 5.123456791e9])
+
+
+def _ghz_vault(tmp_path, dtype="float32"):
+    schema = MeasurementSchema(
+        control=[AxisSpecs([ControlVar("f", GHZ, unit="Hz")]),
+                 AxisSpecs([ControlVar("g", GHZ + 1e9, unit="Hz")])],
+        readout=[ReadoutSpecs("x", DataKind.SCALAR, unit="V")],
+        writetype=WriteType.ALL,
+    )
+    w = ZarrWriter(root=tmp_path, schema=schema, dtype=dtype, overwrite=True, initialize_arrays=True)
+    data = np.arange(9, dtype=float).reshape(3, 3)
+    w.write_all({"x": data})
+    w.write_metadata()
+    return data
+
+
+class TestCoordinatePrecision:
+
+    def test_axes_values_distinct_float64(self, tmp_path):
+        _ghz_vault(tmp_path)
+        v = Vault(tmp_path)
+        assert v.axes["f"].values.dtype == np.float64
+        np.testing.assert_array_equal(v.axes["f"].values, GHZ)
+        np.testing.assert_array_equal(v.axes["g"].values, GHZ + 1e9)
+
+    def test_readout_dtype_independent_of_coordinates(self, tmp_path):
+        _ghz_vault(tmp_path)
+        assert Vault(tmp_path).read("x").dtype == np.float32
+        _ghz_vault(tmp_path, dtype="float64")
+        assert Vault(tmp_path).read("x").dtype == np.float64
+
+    def test_to_xarray_selects_neighbouring_ghz_points_exactly(self, tmp_path):
+        data = _ghz_vault(tmp_path)
+        da = Vault(tmp_path).to_xarray("x")
+        assert da.coords["f"].dtype == np.float64
+        np.testing.assert_array_equal(da.sel(f=5.123456790e9).values, data[1])   # exact, not nearest
+        assert da.coords["f"].attrs["units"] == "Hz"
+
+    def test_old_float32_coordinates_still_read(self, tmp_path):
+        """A vault written before the change stores float32 coordinates; the reader takes them as they are."""
+        data = _ghz_vault(tmp_path)
+        import zarr as _zarr
+        g = _zarr.open_group(str(tmp_path / "vault.zarr"), mode="r+")
+        for name, vals in (("f", GHZ), ("g", GHZ + 1e9)):
+            del g[name]
+            arr = g.create_array(name, shape=vals.shape, dtype="float32")
+            arr[:] = vals
+        v = Vault(tmp_path)
+        assert v.axes["f"].values.dtype == np.float32
+        np.testing.assert_array_equal(v.axes["f"].values, GHZ.astype(np.float32))
+        assert v.shape == (3, 3)
+        np.testing.assert_array_equal(v.values("x"), data)
+        da = v.to_xarray("x")
+        assert da.dims == ("f", "g") and da.coords["f"].dtype == np.float32
+        assert v.axes["f"].length == 3 and v.axes["f"].unit == "Hz"
+
+    def test_old_float32_vault_without_manifest_still_reads(self, tmp_path):
+        _ghz_vault(tmp_path)
+        import zarr as _zarr
+        g = _zarr.open_group(str(tmp_path / "vault.zarr"), mode="r+")
+        for name, vals in (("f", GHZ), ("g", GHZ + 1e9)):
+            del g[name]
+            g.create_array(name, shape=vals.shape, dtype="float32")[:] = vals
+        strip_manifest(tmp_path)
+        v = Vault(tmp_path)
+        assert v.axes["g"].values.dtype == np.float32 and v.shape == (3, 3)
+
+    def test_reverse_axis_roundtrip(self, tmp_path):
+        schema = MeasurementSchema(
+            control=[AxisSpecs([ControlVar("f", GHZ, reverse=True)])],
+            readout=[ReadoutSpecs("x", DataKind.SCALAR)],
+            writetype=WriteType.ALL,
+        )
+        w = ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        w.write_all({"x": np.arange(6.0)})
+        w.write_metadata()
+        v = Vault(tmp_path)
+        np.testing.assert_array_equal(v.axes["f"].values, np.concatenate([GHZ, GHZ[::-1]]))
+        assert v.shape == (6,)
+
+    def test_multi_control_axis_roundtrip(self, tmp_path):
+        a, b = ControlVar("fa", GHZ, unit="Hz"), ControlVar("fb", GHZ + 3e9, unit="Hz")
+        schema = MeasurementSchema(control=[AxisSpecs([a, b])],
+                                   readout=[ReadoutSpecs("x", DataKind.SCALAR)], writetype=WriteType.ALL)
+        w = ZarrWriter(root=tmp_path, schema=schema, overwrite=True, initialize_arrays=True)
+        w.write_all({"x": np.arange(3.0)})
+        w.write_metadata()
+        v = Vault(tmp_path)
+        assert v.axes["fa"].dim == v.axes["fb"].dim == 0
+        np.testing.assert_array_equal(v.axes["fb"].values, GHZ + 3e9)
+        da = v.to_xarray("x")
+        np.testing.assert_array_equal(da.coords["fa"].values, GHZ)

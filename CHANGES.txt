@@ -2,6 +2,16 @@ CHANGES
 =======
 
 [2026-11-14]
+- core: ZarrWriter stores control-variable coordinate arrays as float64 regardless of the
+  writer's dtype (readout data arrays keep dtype, default float32). float32 merged distinct
+  GHz-scale sweep points (5.123456789e9 and 5.123456790e9 were stored as the same value).
+  Covers single and multi-control axes and ControlVar(reverse=True); trailing_dims arrays
+  (keep their own dtype), "_time" (float64) and StreamingWriter are unchanged; shard-size
+  estimates still use the readout dtype only.
+  * vaults written earlier keep their float32 coordinates (already rounded, not recoverable);
+    Vault reads whatever dtype is stored
+  * a readout that holds frequencies as data (e.g. an "fpts" layer) still uses the writer dtype
+- docs: §3.1 coordinate precision (with example), §4.1/§13/§14 dtype wording
 - core: StreamingWriter accepts a ReadoutSpecs per readout (mixed with plain shape tuples);
   unit, contains and trailing_dims are recorded in the attrs["zarro"] manifest at init, numeric
   trailing_dims values are written as "{readout}.{dim}" arrays, and the reader reports them

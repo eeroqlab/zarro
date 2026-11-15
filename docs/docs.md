@@ -164,6 +164,31 @@ print(len(Vbias.values))  # 100
 | `reverse` | `bool` | If True, the values array is doubled: forward then backward sweep |
 | `instrument` | `str` | Source instrument — stored in metadata |
 
+**Coordinate precision.** The writer stores every control variable's values as **float64**, whatever `dtype` the writer uses for readout data.  Float32 resolves only about 500 Hz at 5 GHz and would merge distinct sweep points; coordinate arrays are tiny, so float64 costs nothing.
+
+```python
+import numpy as np
+from zarro import (ZarrWriter, MeasurementSchema, AxisSpecs, ControlVar,
+                   ReadoutSpecs, DataKind, WriteType, open_vault)
+
+f = ControlVar("f", np.array([5.123456789e9, 5.123456790e9]), unit="Hz")   # 1 Hz apart
+schema = MeasurementSchema(control=[AxisSpecs([f])],
+                           readout=[ReadoutSpecs("x", DataKind.SCALAR)],
+                           writetype=WriteType.ALL)
+w = ZarrWriter(root="./data/precision_demo", schema=schema, overwrite=True, initialize_arrays=True)
+w.write_all({"x": np.array([1.0, 2.0])})
+w.write_metadata()
+
+run = open_vault("./data/precision_demo")
+run.axes["f"].values.dtype                     # float64
+np.diff(run.axes["f"].values)                 # array([1.]) — the two points stay 1 Hz apart
+run.read("x").dtype                           # float32 — readouts keep the writer's dtype
+```
+
+Vaults written by earlier versions stored coordinates with the writer's dtype (float32 by default).  They still open normally, but coordinates that were rounded at write time cannot be recovered.
+
+A *readout* that holds frequencies as data (for example an `fpts` layer in an IMAGE readout) is still stored in the writer's `dtype`.  Put such an axis in `trailing_dims` (stored with the dtype of the values you give) or use `dtype="float64"`.
+
 ### 3.2 AxisSpecs
 
 `AxisSpecs` groups one or more `ControlVar` instances that share the **same length** into a single axis. Multiple control vars on the same axis are swept together (e.g. X and Y on a 2D stage).
@@ -314,7 +339,7 @@ writer = ZarrWriter(
     root="./data/run_001",          # directory to store vault.zarr and metadata.yaml
     schema=schema,                  # MeasurementSchema defined above
     tags=["vna", "cooldown_3"],     # optional free-form tags
-    dtype="float32",                # numpy dtype for all data arrays
+    dtype="float32",                # numpy dtype for readout data arrays (coordinates are always float64)
     overwrite=True,                 # overwrite existing files
     initialize_arrays=True,         # create Zarr arrays immediately
     target_file_size_bytes=5*1024*1024,  # target ~5 MB per shard
@@ -1231,6 +1256,8 @@ The same rules as `ZarrWriter` apply ([§3.3](#33-readoutspecs)): a `contains` l
 num_shards = total_bytes // target_file_size_bytes
 ```
 
+`total_bytes` uses the `dtype` of the readout data arrays only.  Control-variable coordinate arrays (always float64) are small, are not sharded, and are not part of the estimate.
+
 Tune `target_file_size_bytes` to match your storage system:
 - Local NVMe SSD → 1–5 MB
 - Network-attached storage (NAS) → 10–50 MB
@@ -1277,6 +1304,7 @@ ControlVar(
     instrument: str = None,
 )
 # Property: .length → int
+# Written to the vault as float64 regardless of the writer's dtype.
 ```
 
 ### AxisSpecs
@@ -1325,7 +1353,7 @@ ZarrWriter(
     root: str | Path,
     schema: MeasurementSchema = None,
     tags: list[str] = [],
-    dtype: str = "float32",
+    dtype: str = "float32",     # readout data arrays; control coordinates are always float64
     overwrite: bool = False,
     initialize_arrays: bool = False,
     target_file_size_bytes: int = 5*1024*1024,
@@ -1381,7 +1409,7 @@ StreamingWriter(
     root: str | Path,
     readouts: dict[str, tuple | ReadoutSpecs],   # name -> trailing shape, or a ReadoutSpecs (name must match the key)
     chunk_size: int = 256,
-    dtype: str = "float32",
+    dtype: str = "float32",     # readout data arrays; "_time" is always float64
     tags: list[str] = [],
     overwrite: bool = False,
 )
