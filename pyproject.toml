@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=68", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "zarro"
-version = "0.0.1"
+dynamic = ["version"]
 description = "A python package to handle data saving in experiments using zarr"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -18,6 +18,9 @@ Homepage = "https://github.com/eeroqlab/zarro"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools_scm]
+version_file = "src/zarro/_version.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

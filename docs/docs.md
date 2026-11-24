@@ -1,0 +1,1599 @@
+# zarro Tutorial
+
+A comprehensive guide to the `zarro` package for structured experimental data saving.
+
+---
+
+## Table of Contents
+
+1. [Overview](#1-overview)
+2. [Core Concepts](#2-core-concepts)
+   - [DataKind](#21-datakind)
+   - [WriteType](#22-writetype)
+3. [Building a Schema](#3-building-a-schema)
+   - [ControlVar](#31-controlvar)
+   - [AxisSpecs](#32-axisspecs)
+   - [ReadoutSpecs](#33-readoutspecs)
+   - [MeasurementSchema](#34-measurementschema)
+4. [Writing Data with ZarrWriter](#4-writing-data-with-zarrwriter)
+   - [Initialization](#41-initialization)
+   - [Pointwise writes](#42-pointwise-writes)
+   - [Tracewise writes](#43-tracewise-writes)
+   - [Imagewise writes](#44-imagewise-writes)
+   - [Write all at once](#45-write-all-at-once)
+5. [Data Kinds in Practice](#5-data-kinds-in-practice)
+   - [SCALAR readouts](#51-scalar-readouts)
+   - [TRACE readouts](#52-trace-readouts)
+   - [IMAGE readouts](#53-image-readouts)
+   - [Mixed readouts](#54-mixed-readouts)
+6. [Metadata](#6-metadata)
+   - [write_metadata](#61-write_metadata)
+   - [write_yaml](#62-write_yaml)
+   - [Tags](#63-tags)
+   - [Vault manifest](#64-vault-manifest)
+7. [Adding Arrays After Initialization](#7-adding-arrays-after-initialization)
+8. [Reading Data](#8-reading-data)
+   - [Quick overview with snapshot](#81-quick-overview-with-snapshot)
+   - [Control axes and coordinates](#82-control-axes-and-coordinates)
+   - [Readout metadata](#83-readout-metadata)
+   - [Reading data arrays](#84-reading-data-arrays)
+   - [xarray integration](#85-xarray-integration)
+   - [Tracking progress mid-run](#86-tracking-progress-mid-run)
+   - [Monitor runs](#87-monitor-runs-streamingwriter)
+   - [Fallback when metadata is missing](#88-fallback-when-metadata-is-missing)
+   - [Low-level zarr access](#89-low-level-zarr-access)
+9. [Experiment ID Management](#9-experiment-id-management)
+10. [NpzWriter](#10-npzwriter)
+11. [Schemaless Writing](#11-schemaless-writing)
+12. [StreamingWriter — Open-Ended Time Series](#12-streamingwriter--open-ended-time-series)
+    - [When to use it](#121-when-to-use-it)
+    - [Initialization](#122-initialization)
+    - [Appending samples](#123-appending-samples)
+    - [Flushing and closing](#124-flushing-and-closing)
+    - [Reading streaming data](#125-reading-streaming-data)
+    - [Mixed readout shapes](#126-mixed-readout-shapes)
+    - [Manual timestamps](#127-manual-timestamps)
+    - [Readout metadata (ReadoutSpecs)](#128-readout-metadata-readoutspecs)
+13. [Sharding and Performance](#13-sharding-and-performance)
+14. [API Reference](#14-api-reference)
+15. [Version Management](#15-version-management)
+
+---
+
+## 1. Overview
+
+`zarro` provides a structured interface for saving experimental data from parameter sweeps. It wraps the [Zarr v3](https://zarr.readthedocs.io/) format with:
+
+- A **declarative schema** that describes what axes you sweep and what you measure
+- **Write helpers** that accept natural index tuples and dicts of arrays, hiding all Zarr indexing
+- **Automatic chunking and sharding** tuned to your write pattern for efficient streaming I/O
+- **Metadata** stored as both Zarr attributes (JSON) and a human-readable `metadata.yaml`
+
+The typical workflow is:
+
+```
+define schema → create writer → run sweep loop → write metadata
+```
+
+---
+
+## 2. Core Concepts
+
+### 2.1 DataKind
+
+`DataKind` is a `StrEnum` that describes the shape of a single measurement readout:
+
+| Value | Meaning | Array shape per point |
+|---|---|---|
+| `DataKind.SCALAR` | Single number | `()` — a scalar |
+| `DataKind.TRACE` | 1-D array | `(N,)` — e.g. a frequency sweep |
+| `DataKind.IMAGE` | 2-D array | `(H, W)` — e.g. a detector frame |
+
+```python
+from zarro import DataKind
+
+DataKind.SCALAR  # "scalar"
+DataKind.TRACE   # "trace"
+DataKind.IMAGE   # "image"
+```
+
+### 2.2 WriteType
+
+`WriteType` is a `StrEnum` that tells the writer how data will arrive during the sweep loop. This controls chunk and shard geometry for optimal I/O:
+
+| Value | When to use | Index tuple length |
+|---|---|---|
+| `WriteType.POINTWISE` | Write one point at a time | `len(control_shape)` |
+| `WriteType.TRACEWISE` | Write one trace (row) at a time | `len(control_shape) - 1` |
+| `WriteType.IMAGEWISE` | Write one image (plane) at a time | `len(control_shape) - 2` |
+| `WriteType.ALL` | Write the entire array at once | — (no index needed) |
+
+```python
+from zarro import WriteType
+
+WriteType.POINTWISE   # "pointwise"
+WriteType.TRACEWISE   # "tracewise"
+WriteType.IMAGEWISE   # "imagewise"
+WriteType.ALL         # "all"
+```
+
+---
+
+## 3. Building a Schema
+
+### 3.1 ControlVar
+
+`ControlVar` describes a single swept parameter — its name, the array of values it takes, and optional metadata.
+
+```python
+from zarro import ControlVar
+import numpy as np
+
+# Basic usage
+freq = ControlVar(
+    name="freq",
+    values=np.linspace(4e9, 8e9, 1601),
+    unit="Hz",
+)
+
+# With instrument tag
+gate_voltage = ControlVar(
+    name="Vgt",
+    values=np.linspace(-0.5, 0.5, 101),
+    unit="V",
+    instrument="Keithley2400",
+)
+
+# Hysteresis sweep: values array is automatically doubled [forward, reverse]
+Vbias = ControlVar(
+    name="Vbias",
+    values=np.linspace(0, 1, 50),
+    unit="V",
+    reverse=True,   # stored array becomes shape (100,): forward then backward
+)
+print(len(Vbias.values))  # 100
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `name` | `str` | Variable name (used as array key in vault) |
+| `values` | `np.ndarray` | Sweep values |
+| `unit` | `str` | Physical unit — stored in metadata |
+| `reverse` | `bool` | If True, the values array is doubled: forward then backward sweep |
+| `instrument` | `str` | Source instrument — stored in metadata |
+
+**Coordinate precision.** The writer stores every control variable's values as **float64**, whatever `dtype` the writer uses for readout data.  Float32 resolves only about 500 Hz at 5 GHz and would merge distinct sweep points; coordinate arrays are tiny, so float64 costs nothing.
+
+```python
+import numpy as np
+from zarro import (ZarrWriter, MeasurementSchema, AxisSpecs, ControlVar,
+                   ReadoutSpecs, DataKind, WriteType, open_vault)
+
+f = ControlVar("f", np.array([5.123456789e9, 5.123456790e9]), unit="Hz")   # 1 Hz apart
+schema = MeasurementSchema(control=[AxisSpecs([f])],
+                           readout=[ReadoutSpecs("x", DataKind.SCALAR)],
+                           writetype=WriteType.ALL)
+w = ZarrWriter(root="./data/precision_demo", schema=schema, overwrite=True, initialize_arrays=True)
+w.write_all({"x": np.array([1.0, 2.0])})
+w.write_metadata()
+
+run = open_vault("./data/precision_demo")
+run.axes["f"].values.dtype                     # float64
+np.diff(run.axes["f"].values)                 # array([1.]) — the two points stay 1 Hz apart
+run.read("x").dtype                           # float32 — readouts keep the writer's dtype
+```
+
+Vaults written by earlier versions stored coordinates with the writer's dtype (float32 by default).  They still open normally, but coordinates that were rounded at write time cannot be recovered.
+
+A *readout* that holds frequencies as data (for example an `fpts` layer in an IMAGE readout) is still stored in the writer's `dtype`.  Put such an axis in `trailing_dims` (stored with the dtype of the values you give) or use `dtype="float64"`.
+
+### 3.2 AxisSpecs
+
+`AxisSpecs` groups one or more `ControlVar` instances that share the **same length** into a single axis. Multiple control vars on the same axis are swept together (e.g. X and Y on a 2D stage).
+
+```python
+from zarro import AxisSpecs, ControlVar
+import numpy as np
+
+# Single variable per axis (most common)
+axis0 = AxisSpecs([ControlVar("power", np.linspace(-30, 0, 20), unit="dBm")])
+axis1 = AxisSpecs([ControlVar("freq",  np.linspace(4e9, 8e9, 1601), unit="Hz")])
+
+# Two variables sharing the same axis (swept together)
+x = ControlVar("x", np.linspace(0, 1, 50), unit="mm")
+y = ControlVar("y", np.linspace(0, 1, 50), unit="mm")
+axis_xy = AxisSpecs([x, y])   # x and y must have same length
+```
+
+All `ControlVar` instances in a single `AxisSpecs` must have the same `.length`. A `ValueError` is raised otherwise.
+
+### 3.3 ReadoutSpecs
+
+`ReadoutSpecs` describes a single measurement channel — its name, data kind, and optional metadata.
+
+```python
+from zarro import ReadoutSpecs, DataKind
+
+# Scalar readout
+lockin_x = ReadoutSpecs(
+    name="lockin_X",
+    kind=DataKind.SCALAR,
+    unit="V",
+    contains="in-phase signal",
+)
+
+# Trace readout (1601-point VNA trace)
+s21 = ReadoutSpecs(
+    name="S21",
+    kind=DataKind.TRACE,
+    shape=(1601,),
+    unit="dBm",
+    contains="transmission magnitude",
+)
+
+# Image readout (480 x 640 detector)
+frame = ReadoutSpecs(
+    name="camera",
+    kind=DataKind.IMAGE,
+    shape=(480, 640),
+    unit="counts",
+)
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `name` | `str` | Array key in vault |
+| `kind` | `DataKind` | SCALAR, TRACE, or IMAGE |
+| `unit` | `str` | Physical unit of the readout |
+| `shape` | `tuple[int, ...]` | **Required** for TRACE and IMAGE: trailing dimension sizes |
+| `contains` | `str \| list[str]` | Human description, or list of component names (auto-promotes to `trailing_dims`) |
+| `trailing_dims` | `list[dict]` | Named trailing dimensions (see below) |
+
+`trailing_dims` is an ordered list of dicts, one per trailing dimension, from outermost to innermost.  Each dict may contain:
+
+| Key | Type | Description |
+|---|---|---|
+| `name` | `str` | Dimension name used in xarray (`"freq"`, `"component"`, …) |
+| `unit` | `str` | Physical unit for a homogeneous axis (e.g. `"Hz"`) |
+| `values` | `list` or `ndarray` | Coordinate values. String lists go in `metadata.yaml`; numeric arrays are stored as `{readout}.{dim_name}` in vault.zarr |
+| `units` | `list[str]` | Per-label units for a component dimension (one entry per value) |
+
+**Validation** — `ReadoutSpecs` checks itself when it is created and raises `ValueError` for:
+- a `kind`/`shape` mismatch (SCALAR needs no shape, TRACE a 1-D shape, IMAGE a 2-D shape)
+- more `trailing_dims` entries than trailing dimensions (fewer is allowed; the rest get generic names)
+- a `values` array whose length differs from its dimension, or a `units` list of the wrong length
+- a `trailing_dims` entry without a string `name`, or duplicate names
+
+**Component shorthand** — passing `contains` as a list on a TRACE or IMAGE readout automatically creates the equivalent `trailing_dims` entry as soon as the `ReadoutSpecs` is built (its length must match the first trailing dimension), so the two forms below are identical:
+
+```python
+# shorthand (old style — still supported)
+ReadoutSpecs("lockin_xy", DataKind.TRACE, shape=(2,), contains=["X", "Y"])
+
+# explicit (new style — required when adding per-label units)
+ReadoutSpecs(
+    "lockin_xy", DataKind.TRACE, shape=(2,),
+    trailing_dims=[{"name": "component", "values": ["X", "Y"]}],
+)
+```
+
+**Per-label units** on a component dim — use `"units"` (a list) instead of `"unit"` (a string):
+
+```python
+ReadoutSpecs(
+    "resonance",
+    DataKind.IMAGE,
+    shape=(3, 801),
+    trailing_dims=[
+        {"name": "component", "values": ["fpts", "mag", "phase"],
+         "units": ["Hz", "dBm", "deg"]},          # one unit per label
+        {"name": "freq", "unit": "Hz", "values": np.linspace(4e9, 8e9, 801)},
+    ],
+)
+# → run.to_xarray("resonance").attrs["component_units"]
+#   == {"fpts": "Hz", "mag": "dBm", "phase": "deg"}
+```
+
+### 3.4 MeasurementSchema
+
+`MeasurementSchema` combines control axes and readouts into a complete description of the measurement.
+
+```python
+from zarro import MeasurementSchema, AxisSpecs, ReadoutSpecs, ControlVar, DataKind, WriteType
+import numpy as np
+
+power  = ControlVar("power", np.linspace(-30, 0, 20),     unit="dBm")
+freq   = ControlVar("freq",  np.linspace(4e9, 8e9, 1601), unit="Hz")
+
+schema = MeasurementSchema(
+    control=[AxisSpecs([power]), AxisSpecs([freq])],
+    readout=[
+        ReadoutSpecs("S21_mag",   DataKind.SCALAR, unit="dBm"),
+        ReadoutSpecs("S21_phase", DataKind.SCALAR, unit="deg"),
+        ReadoutSpecs("S21_trace", DataKind.TRACE,  shape=(1601,), unit="dBm"),
+    ],
+    writetype=WriteType.POINTWISE,
+)
+
+print(schema.axis_names)    # {'axis0': {'power': {'unit': 'dBm'}}, 'axis1': {'freq': {'unit': 'Hz'}}}
+print(schema.readout_names) # ['S21_mag', 'S21_phase', 'S21_trace']
+print(schema.meta)          # full metadata dict used in file headers
+```
+
+The resulting **control shape** is `(20, 1601)` — one dimension per `AxisSpecs`.
+
+---
+
+## 4. Writing Data with ZarrWriter
+
+### 4.1 Initialization
+
+```python
+from zarro import ZarrWriter
+
+writer = ZarrWriter(
+    root="./data/run_001",          # directory to store vault.zarr and metadata.yaml
+    schema=schema,                  # MeasurementSchema defined above
+    tags=["vna", "cooldown_3"],     # optional free-form tags
+    dtype="float32",                # numpy dtype for readout data arrays (coordinates are always float64)
+    overwrite=True,                 # overwrite existing files
+    initialize_arrays=True,         # create Zarr arrays immediately
+    target_file_size_bytes=5*1024*1024,  # target ~5 MB per shard
+)
+```
+
+Setting `initialize_arrays=True` creates:
+- One coordinate array per `ControlVar` (pre-filled with sweep values)
+- One data array per `ReadoutSpecs` (pre-allocated, filled with zeros)
+- A `metadata.yaml` file
+
+If `initialize_arrays=False`, you can call `writer.add_array()` later to build up the vault manually.
+
+### 4.2 Pointwise writes
+
+Use when acquiring one scalar/trace/image at each grid point.
+
+```python
+# schema.writetype = WriteType.POINTWISE
+# control_shape = (N_power, N_freq)
+
+for i in range(N_power):
+    for j in range(N_freq):
+        mag, phase = vna.get_point()
+        writer.write_point(
+            index=(i, j),
+            data={"S21_mag": mag, "S21_phase": phase},
+        )
+```
+
+The `index` tuple must have length `len(control_shape)`.
+
+### 4.3 Tracewise writes
+
+Use when the inner axis is always swept as a unit (e.g. a VNA returns a full trace per trigger).
+
+```python
+# schema.writetype = WriteType.TRACEWISE
+# control_shape = (N_power, N_freq)
+# index length = len(control_shape) - 1 = 1
+# each write fills one full row along the inner (freq) axis
+
+schema = MeasurementSchema(
+    control=[AxisSpecs([power]), AxisSpecs([freq])],
+    readout=[ReadoutSpecs("S21", DataKind.SCALAR)],
+    writetype=WriteType.TRACEWISE,
+)
+writer = ZarrWriter(root="./data/run_002", schema=schema,
+                    overwrite=True, initialize_arrays=True)
+
+for i in range(N_power):
+    trace = vna.sweep()              # shape (N_freq,) = (1601,)
+    writer.write_trace(
+        index=(i,),
+        data={"S21": trace},
+    )
+```
+
+### 4.4 Imagewise writes
+
+Use when the two innermost axes are always acquired together (e.g. a 2D raster image).
+
+```python
+# control_shape = (N_z, N_y, N_x)
+# index length = len(control_shape) - 2 = 1
+
+schema = MeasurementSchema(
+    control=[AxisSpecs([z_var]), AxisSpecs([y_var]), AxisSpecs([x_var])],
+    readout=[ReadoutSpecs("image", DataKind.SCALAR)],
+    writetype=WriteType.IMAGEWISE,
+)
+writer = ZarrWriter(root="./data/run_003", schema=schema,
+                    overwrite=True, initialize_arrays=True)
+
+for k in range(N_z):
+    img = camera.capture()           # shape (N_y, N_x)
+    writer.write_image(
+        index=(k,),
+        data={"image": img},
+    )
+```
+
+### 4.5 Write all at once
+
+Use when data is generated in memory before saving (simulations, post-processing).
+
+```python
+schema = MeasurementSchema(
+    control=[AxisSpecs([power]), AxisSpecs([freq])],
+    readout=[ReadoutSpecs("S21", DataKind.SCALAR)],
+    writetype=WriteType.ALL,
+)
+writer = ZarrWriter(root="./data/run_004", schema=schema,
+                    overwrite=True, initialize_arrays=True)
+
+full_data = simulate()               # shape (N_power, N_freq)
+writer.write_all({"S21": full_data})
+```
+
+---
+
+## 5. Data Kinds in Practice
+
+### 5.1 SCALAR readouts
+
+Each write delivers a single number per readout. The stored array shape equals the control shape.
+
+```
+control_shape = (20, 101)
+S21_mag array shape → (20, 101)
+```
+
+### 5.2 TRACE readouts
+
+Each write delivers a 1-D array per readout. The stored array shape is `control_shape + (trace_length,)`.
+
+```
+control_shape = (20, 101), trace shape (1601,)
+S21 array shape → (20, 101, 1601)
+```
+
+```python
+ReadoutSpecs("S21", DataKind.TRACE, shape=(1601,))
+```
+
+Use `trailing_dims` to name the trace axis and store its coordinate values. The writer saves numeric values as a companion zarr array (`S21.freq`), which the reader picks up automatically for `to_xarray`:
+
+```python
+ReadoutSpecs(
+    "S21",
+    DataKind.TRACE,
+    shape=(1601,),
+    unit="dBm",
+    trailing_dims=[
+        {"name": "freq", "unit": "Hz", "values": np.linspace(4e9, 8e9, 1601)},
+    ],
+)
+# → run.to_xarray("S21") has dims ("power", "freq") with freq coords attached
+```
+
+A TRACE whose samples represent named channels (e.g. lock-in X/Y) uses a string `values` list. String labels are stored in `metadata.yaml` only (no extra zarr array).  The `contains`-as-list shorthand auto-promotes to this form at schema build time:
+
+```python
+# shorthand — identical to explicit trailing_dims below
+ReadoutSpecs("lockin_xy", DataKind.TRACE, shape=(2,), contains=["X", "Y"])
+
+# explicit — use this when you also need per-label units
+ReadoutSpecs(
+    "lockin_xy",
+    DataKind.TRACE,
+    shape=(2,),
+    trailing_dims=[{"name": "component", "values": ["X", "Y"], "units": ["V", "V"]}],
+)
+# → run.to_xarray("lockin_xy") has a "component" dim with ["X","Y"] coords
+# → run.values("lockin_xy", component="X") selects the X layer
+```
+
+### 5.3 IMAGE readouts
+
+Each write delivers a 2-D array per readout. The stored array shape is `control_shape + (H, W)`.
+
+```
+control_shape = (10,), image shape (480, 640)
+frame array shape → (10, 480, 640)
+```
+
+```python
+ReadoutSpecs("frame", DataKind.IMAGE, shape=(480, 640))
+```
+
+Use `trailing_dims` to name both trailing axes and attach coordinate arrays. This is especially useful when the two dimensions represent physically meaningful quantities (e.g. named layers × frequency):
+
+```python
+ReadoutSpecs(
+    "resonance",
+    DataKind.IMAGE,
+    shape=(3, 801),
+    trailing_dims=[
+        {"name": "component", "values": ["fpts", "mag", "phase"],
+         "units": ["Hz", "dBm", "deg"]},
+        {"name": "freq", "unit": "Hz", "values": np.linspace(4e9, 8e9, 801)},
+    ],
+)
+# → run.to_xarray("resonance") has dims (..., "component", "freq")
+# → run.to_xarray("resonance").attrs["component_units"]
+#   == {"fpts": "Hz", "mag": "dBm", "phase": "deg"}
+# → run.to_xarray("resonance", component="mag") drops the component dim
+```
+
+### 5.4 Mixed readouts
+
+A single schema can contain multiple readout kinds simultaneously:
+
+```python
+schema = MeasurementSchema(
+    control=[AxisSpecs([temp]), AxisSpecs([freq])],
+    readout=[
+        ReadoutSpecs("resistance",  DataKind.SCALAR, unit="Ohm"),
+        ReadoutSpecs("S11",         DataKind.TRACE,  shape=(801,), unit="dBm"),
+        ReadoutSpecs("noise_image", DataKind.IMAGE,  shape=(64, 64), unit="V/rtHz"),
+    ],
+    writetype=WriteType.POINTWISE,
+)
+```
+
+In `write_point()`, supply whichever readouts were measured at that point; you do not have to provide all of them in a single call.
+
+---
+
+## 6. Metadata
+
+### 6.1 write_metadata
+
+`write_metadata()` writes both Zarr group attributes (JSON) and `metadata.yaml`. It automatically includes:
+- `date` — ISO 8601 timestamp of when this method was called
+- `schema` — control axis names and readout specs from the schema
+- `tags` — the writer's tag list
+
+```python
+writer.write_metadata(meta={
+    "operator": "alice",
+    "sample":   "chip_B2",
+    "cooldown": 3,
+    "fridge":   "BlueFors_XLD",
+})
+```
+
+Call `write_metadata()` once, typically **after** the sweep completes.
+
+### 6.2 write_yaml
+
+`write_yaml()` writes only the YAML file without touching Zarr attributes. Useful when you want a quick on-disk record without committing to Zarr attribute format.
+
+```python
+writer.write_yaml(meta={"status": "in_progress"})
+```
+
+If `overwrite=False` (the default) and `metadata.yaml` already exists, a `UserWarning` is emitted and the file is not overwritten.
+
+### 6.3 Tags
+
+Tags are free-form strings that can be set at construction time or mutated before calling `write_metadata()`:
+
+```python
+writer = ZarrWriter(root="...", schema=schema, tags=["vna"])
+# ... run sweep ...
+writer.tags.append("temperature_sweep")
+writer.write_metadata()
+```
+
+### 6.4 Vault manifest
+
+Besides the metadata above, every writer stores a small **manifest** in the vault's group attributes (`vault.zarr/zarr.json` → `attributes["zarro"]`). It is the one place `open_vault` reads the run's structure from, so it needs no format guessing.
+
+- `ZarrWriter` writes it at initialization (and again in `write_metadata()`), so a run can be opened mid-sweep even before `metadata.yaml` or the final attributes exist.
+- `StreamingWriter` writes it at init; readouts given as a `ReadoutSpecs` ([§12.8](#128-readout-metadata-readoutspecs)) carry their unit, `contains` and `trailing_dims` in it too.
+- `write_metadata()` / `close()` / `dump()` merge into the attributes, so the manifest is never overwritten.
+
+```json
+"zarro": {
+  "version": 2,
+  "kind": "sweep",
+  "axes": [{"name": "power", "dim": 0, "unit": "dBm"},
+           {"name": "freq",  "dim": 1, "unit": "Hz"}],
+  "readouts": [
+    {"name": "S21", "kind": "trace", "shape": [1601], "unit": "dBm", "contains": null,
+     "trailing_dims": [{"name": "freq", "unit": "Hz"}]}
+  ]
+}
+```
+
+Coordinate and data values are not duplicated here: they stay in their own arrays (`power`, `freq`, `S21.freq`, …). Only string labels (component names) and per-label `units` live in the manifest. `vault.metadata` does not include the manifest.
+
+---
+
+## 7. Adding Arrays After Initialization
+
+`add_array()` lets you attach derived or auxiliary arrays to an existing vault:
+
+```python
+writer = ZarrWriter(root="./data/run_001", overwrite=True)
+
+# Compute something from raw data
+background = np.load("background.npy")
+writer.add_array(
+    name="background",
+    value=background,
+    meta={"description": "dark-frame reference"},
+)
+```
+
+If `overwrite=False` and an array with that name already exists, a `KeyError` is raised.
+
+For writing multiple arrays at once without a schema, use `dump()`:
+
+```python
+writer.dump(
+    data={"x": x_array, "y": y_array, "z": z_array},
+    meta={"source": "post-processing"},
+)
+```
+
+For a fully NPZ-like workflow (no schema, no streaming), see [Section 11](#11-schemaless-writing).
+
+---
+
+## 8. Reading Data
+
+Use `open_vault` (or `Vault` directly) to open a run directory for analysis.
+The reader works on finished runs, interrupted runs, and runs still in progress.
+
+```python
+from zarro import open_vault
+
+run = open_vault("./data/run_001")
+
+# Kind: "sweep" for ZarrWriter runs, "monitor" for StreamingWriter runs
+print(run.kind)          # "sweep"
+print(run.shape)         # (20, 1601)
+print(run.tags)          # ["vna", "2K"]
+print(run.metadata)      # full merged dict (zarr attrs + metadata.yaml)
+```
+
+### 8.1 Quick overview with `snapshot`
+
+Call `snapshot()` for a formatted summary of the vault — useful at the Python
+REPL or in a notebook after opening a run:
+
+```python
+run.snapshot()
+```
+
+Example output for a 2D sweep:
+
+```
+Kind:  2D step sweep       Shape: 20x1601       Date: 2026-11-12T14:03:21
+Tags:  vna, 2K
+Path:  ./data/run_001
+
+Control axes
+role   variable  length  unit
+-----  --------  ------  ----
+step   power     20      dBm
+sweep  freq      1601    Hz
+
+Readouts
+name     kind    shape    unit  contains
+-------  ------  -------  ----  --------
+S21_mag  scalar  ()       dBm   —
+S21      trace   (1601,)  V     S21
+```
+
+Dimension roles — `sweep` (innermost / fastest), `step`, `frame`, `volume` (slowest) — appear in the header (the outermost role, e.g. `2D step sweep`) and in the axis table's role column.  A 3D sweep reads `3D frame sweep`.
+
+For a **monitor** run the control-axes block is replaced by `Time axis: N samples`.
+
+For a **multi-control axis** (two variables sharing one axis), each variable
+appears on its own row with the same role.
+
+`snapshot` prints plain-text tables and has no extra dependencies.
+
+### 8.2 Control axes and coordinates
+
+``run.axes`` is a ``dict[str, Axis]`` keyed by variable name.
+Each entry has ``.values``, ``.unit``, ``.length``, and ``.dim`` (the grid
+dimension index it spans).
+
+```python
+# Look up a variable directly
+run.axes["freq"].values   # coordinate array, shape (1601,)
+run.axes["freq"].unit     # "Hz"
+run.axes["freq"].length   # 1601
+run.axes["freq"].dim      # 1  — which dimension of the grid
+
+run.axes["power"].dim     # 0
+
+# Iterate over all control variables
+for name, ax in run.axes.items():
+    print(name, ax.dim, ax.length, ax.unit)
+```
+
+For a **multi-control axis** (two variables swept together on the same grid
+dimension), both entries share the same ``.dim``:
+
+```python
+run.axes["Vch"].dim   # 0
+run.axes["Vm"].dim    # 0  — moved in lockstep with Vch
+```
+
+### 8.3 Readout metadata
+
+```python
+for name, r in run.readouts.items():
+    print(name, r.kind, r.shape, r.unit, r.contains)
+    # S21_mag  scalar  ()       dBm   None
+    # S21      trace   (1601,)  V     S21
+    # frame    image   (64,64)  None  None
+```
+
+### 8.4 Reading data arrays
+
+```python
+# Raw array — 0.0 where nothing has been written yet
+all_mag = run.read("S21_mag")           # shape (20, 1601)
+row_5   = run.read("S21_mag", (5,))     # shape (1601,)
+point   = run.read("S21_mag", (3, 100)) # scalar
+
+# NaN-masked array — NaN where unwritten (use this for mid-run reads)
+signal = run.values("S21_mag")          # shape (20, 1601), NaN at unwritten points
+```
+
+#### Selecting a named component
+
+When a readout has named layers (via `trailing_dims` with a component dimension, or via the `contains`-as-list shorthand), use `component=` to extract one layer by name.  The component dimension is removed from the result.
+
+```python
+# resonance: shape (20, 1601, 3, 801), component labels ['fpts','mag','phase']
+run.read("resonance", component="mag")          # shape (20, 1601, 801)
+run.read("resonance", (5,), component="mag")    # shape (1601, 801)  — row 5
+run.values("resonance", component="mag")        # shape (20, 1601, 801), NaN at unwritten
+
+# also works on TRACE with shape=(2,) and labels ["X","Y"]
+run.values("lockin_xy", component="X")          # shape == control_shape
+
+# passing component= when no component dim exists raises VaultError
+```
+
+### 8.5 xarray integration
+
+`to_xarray` wraps any readout as an `xarray.DataArray` with labeled
+coordinates, so you get slicing, interpolation, and plotting for free.
+
+```python
+da = run.to_xarray("S21_mag")
+# <xarray.DataArray 'S21_mag' (Vch: 20, Vg: 50)>
+# Coordinates:
+#   * Vch  (Vch) float32 -0.5 ... 0.5   [units: V]
+#   * Vg   (Vg)  float32 -1.0 ... 1.0   [units: V]
+# Attributes: units: dBm, long_name: S21_mag
+```
+
+**Selecting a slice by value:**
+
+```python
+# fix Vch to nearest point, return 1-D array along Vg
+da.sel(Vch=0.0, method="nearest")
+
+# fix both axes → scalar DataArray
+da.sel(Vch=0.0, Vg=-0.5, method="nearest")
+
+# range slice along Vg
+da.sel(Vg=slice(-0.3, 0.3))
+
+# by integer index
+da.isel(Vch=5)
+```
+
+**Check which coordinate value was actually selected:**
+
+```python
+sliced = da.sel(Vch=0.03, method="nearest")
+sliced.coords["Vch"].item()   # e.g. 0.025
+```
+
+**Plotting:**
+
+```python
+da.plot()                                       # 2-D heatmap, axis-labeled
+da.sel(Vch=0.0, method="nearest").plot()        # 1-D line along Vg
+da.plot.pcolormesh(cmap="RdBu_r")
+```
+
+**IMAGE readouts with named components:**
+
+```python
+# resonance: shape (20, 50, 3, 801), component labels ['fpts','mag','phase']
+da_mag = run.to_xarray("resonance", component="mag")   # shape (20, 50, 801)
+da_mag.sel(Vch=0.0, method="nearest").plot()           # 2-D map: Vg vs freq
+
+# all components at once
+da = run.to_xarray("resonance")     # dims: (..., "component", "freq")
+da.attrs["component_units"]         # {"fpts": "Hz", "mag": "dBm", "phase": "deg"}
+```
+
+**Multi-control axes** (two variables swept together on the same dimension):
+
+```python
+# dim named "dim0" when multiple variables share it; both appear as coords
+da.coords["Vch"].values    # coord array for first variable
+da.coords["Vg"].values     # coord array for second variable (same length)
+da.sel(Vch=0.0, method="nearest")   # still works — selects along dim0
+```
+
+**Labeled trailing dimensions (`trailing_dims`):**
+
+When a readout was written with `trailing_dims` in its `ReadoutSpecs`, `to_xarray` automatically attaches named coordinates for those dimensions:
+
+```python
+# S21 written with trailing_dims=[{"name":"freq","unit":"Hz","values":...}]
+da = run.to_xarray("S21")
+# <xarray.DataArray 'S21' (power: 20, freq: 1601)>
+# Coordinates:
+#   * power  (power) float32  [units: dBm]
+#   * freq   (freq)  float64 4.0e9 ... 8.0e9  [units: Hz]
+```
+
+For older vaults without stored trailing coords, pass them explicitly with `trailing_coords=`:
+
+```python
+da = run.to_xarray("S21", trailing_coords={
+    "freq": np.linspace(4e9, 8e9, 1601),
+})
+```
+
+The `trailing_coords=` dict maps dimension names to 1-D coordinate arrays.
+
+Unwritten grid points appear as `NaN`, same as `values()`.  xarray is an
+optional dependency; a clear `ImportError` is raised if it is not installed.
+
+### 8.6 Tracking progress mid-run
+
+`written_mask` returns a boolean grid that is True where data has been written.
+It works on running sweeps without blocking the writer.
+
+```python
+mask = run.written_mask("S21_mag")       # shape == run.shape
+print(f"{mask.sum()} / {mask.size} points done")
+
+# Custom visiting order (e.g. snake sweep: row 0 L→R, row 1 R→L, ...)
+mask = run.written_mask("S21_mag", order=my_order_array)
+```
+
+**How it works:**
+
+- **Scalar** readouts are stored in plain chunks: a point is written when its
+  chunk file exists on disk.
+- **Trace/image** readouts are stored in shards: a point is written when any
+  of its values is non-zero (since zarr fills unwritten positions with 0.0).
+- In both cases, every position visited *before* the last confirmed written
+  position is also counted as written (order-prefix rule), so a genuine 0.0
+  inside the scanned region remains visible.
+
+### 8.7 Monitor runs (StreamingWriter)
+
+```python
+run = open_vault("./data/mon_001")
+print(run.kind)    # "monitor"
+print(run.shape)   # (n_samples,) — grows while the run is live
+print(run.time)    # unix timestamps, shape (n_samples,)
+
+x_values = run.values("x")   # shape (n_samples,), always fully written
+
+da = run.to_xarray("x")      # dims ("time",); trace/image readouts add "sample" / "row","col"
+da.coords["time"]            # raw Unix seconds, attrs["units"] == "s (unix epoch)"
+da.sel(time=run.time[0], method="nearest")
+```
+
+The vault can be opened before the writer calls `close()`.
+The readouts and their shapes come from the vault's manifest ([§6.4](#64-vault-manifest)); for older vaults they are inferred from the array dimensions.
+
+### 8.8 Fallback when metadata is missing
+
+Vaults written by this version carry their own manifest ([§6.4](#64-vault-manifest)) and open without any of this.  For **older vaults** (no manifest) whose `metadata.yaml` is gone and whose zarr attributes were never written, pass the
+structure explicitly:
+
+```python
+from zarro import Vault
+
+run = Vault(
+    "./data/run_001",
+    control={"axis0": {"freq": {"unit": "Hz"}}, "axis1": {"power": {"unit": "dBm"}}},
+    readouts={"S21_mag": {"kind": "scalar", "unit": "dBm"}},
+)
+```
+
+### 8.9 Low-level zarr access
+
+The underlying zarr group is always accessible for direct numpy-style reads:
+
+```python
+import zarr
+z = zarr.open("./data/run_001/vault.zarr", mode="r")
+print(list(z.keys()))
+all_mag = z["S21_mag"][:]     # shape (20, 1601)
+```
+
+---
+
+## 9. Experiment ID Management
+
+`ExperimentID` manages a directory of sequentially numbered experiment folders:
+
+```python
+from pathlib import Path
+from zarro import ExperimentID
+
+root = Path("./experiments_demo")
+for name in ["0001", "0003_fridge", "notes", "2026_backup"]:
+    (root / name).mkdir(parents=True, exist_ok=True)
+for name in ["0001", "0003_fridge"]:
+    (root / name / "vault.zarr").mkdir()     # a real run holds vault.zarr, data.npz or metadata.yaml
+
+eid = ExperimentID(root)
+
+print(eid.current_id())   # 3 — "notes" and "2026_backup" are not runs, the gap at 0002 is fine
+print(eid.next_id())      # 4
+print(eid.next_dir())     # PosixPath('experiments_demo/0004')
+print(eid.current_dir())  # PosixPath('experiments_demo/0003')
+
+# Look up an existing folder by integer ID or string name
+print(eid.get_dir_name(2))             # PosixPath('experiments_demo/0002')
+print(eid.get_dir_name("special_run")) # PosixPath('experiments_demo/special_run')
+```
+
+Typical usage in a measurement script:
+
+```python
+eid = ExperimentID(root="./experiments")
+run_id = eid.next_id()
+run_dir = eid.get_dir_name(run_id)
+
+writer = ZarrWriter(root=run_dir, schema=schema,
+                    overwrite=False, initialize_arrays=True)
+# ... run sweep ...
+writer.write_metadata(meta={"id": run_id})
+```
+
+Folder names use zero-padded integers of at least four digits (`0001`, `0002`, …, `9999`, `10000`) so they sort correctly in file explorers.
+
+### What counts as a run folder
+
+`current_id()` is the largest id among **run folders**, or `0` if there are none.  A run folder is a subfolder that
+
+- is named exactly `NNNN` or `NNNN_suffix` (four or more digits, no extra leading zeros), e.g. `0007` or `0007_fridge`, **and**
+- contains `vault.zarr` (a directory), `data.npz` or `metadata.yaml`, i.e. output from `ZarrWriter`, `NpzWriter` or `StreamingWriter`.
+
+Everything else is ignored: `notes`, `2026_backup`, a file called `0009`, hidden folders.  The result does not depend on the order the filesystem lists folders, and ids are compared as numbers (`10000` is larger than `9999`).
+
+Consequences:
+
+- **Gaps are fine.** If `0002` and `0003` were deleted, the next id after `0004` is still `5`.
+- **Deleting the newest run frees its id.** After removing `0003` from `0001..0003`, `next_id()` is `3` again; keep that in mind before archiving recent runs elsewhere.
+- **A numbered folder without output is not a run.** An empty `0002` (a manual `mkdir`, or a crash before the writer started) does not use up its id; the next run reuses it.  A run that got as far as creating `vault.zarr` keeps its id.
+- **Two processes can still pick the same id** if they call `next_dir()` at the same moment, because nothing reserves the folder until a writer creates it.
+
+`open_vault` resolves a bare id such as `open_vault("./experiments/0007")` with the same rule ([§14](#open_vaultpath)), so both always agree on what a run folder is.
+
+---
+
+## 10. NpzWriter
+
+`NpzWriter` is a simpler alternative that saves data as a single `.npz` file. Use it when the dataset fits in memory and you do not need streaming writes or Zarr's chunked access.
+
+```python
+from zarro import NpzWriter, MeasurementSchema, AxisSpecs, ReadoutSpecs, ControlVar, DataKind
+import numpy as np
+
+schema = MeasurementSchema(
+    control=[AxisSpecs([ControlVar("freq", np.linspace(1e9, 5e9, 501))])],
+    readout=[ReadoutSpecs("S21", DataKind.TRACE, shape=(501,))],
+)
+
+writer = NpzWriter(
+    root="./data/npz_run",
+    schema=schema,
+    tags=["quick_check"],
+    compressed=False,   # use np.savez_compressed for smaller files
+    overwrite=True,
+)
+
+# Generate or acquire data
+data = {"S21": np.random.rand(501, 501).astype("float32")}
+
+writer.write(data)
+writer.write_metadata(meta={"operator": "bob"})
+```
+
+Files created:
+- `data.npz` — NumPy archive, loadable with `np.load()`
+- `metadata.yaml` — human-readable metadata
+
+```python
+import numpy as np
+npz = np.load("./data/npz_run/data.npz")
+print(list(npz.keys()))   # ['S21']
+s21 = npz["S21"]          # shape (501, 501)
+```
+
+---
+
+## 11. Schemaless Writing
+
+`ZarrWriter` (and `NpzWriter`) work without a schema when you just need to store a collection of arrays with metadata:
+
+```python
+from zarro import ZarrWriter
+import numpy as np
+
+writer = ZarrWriter(root="./data/schemaless", overwrite=True)
+
+# write_npzlike: store multiple arrays with metadata
+writer.dump(
+    data={
+        "frequencies": np.linspace(1e9, 5e9, 1001),
+        "S21_db":      np.random.rand(1001),
+        "S21_phase":   np.random.rand(1001),
+    },
+    meta={
+        "description": "single VNA sweep",
+        "date": "2026-04-10",
+    },
+)
+```
+
+You can also add arrays one at a time:
+
+```python
+writer.add_array("Vgt_values", np.linspace(-1, 1, 200))
+writer.add_array("conductance", G_matrix)
+```
+
+---
+
+## 12. StreamingWriter — Open-Ended Time Series
+
+### 12.1 When to use it
+
+`ZarrWriter` requires the full sweep grid to be known before acquisition begins. `StreamingWriter` is the right tool when:
+
+- The number of samples is not known in advance (e.g. event-driven acquisition, user-terminated runs)
+- Data arrives asynchronously or at irregular intervals
+- You are logging instrument state over time alongside measurements
+
+The trade-off: `StreamingWriter` can only append along a single time axis. There is no 2-D grid, no tracewise/imagewise distinction — just a sequence of samples, each optionally paired with a Unix timestamp.
+
+### 12.2 Initialization
+
+```python
+from zarro import StreamingWriter
+
+writer = StreamingWriter(
+    root="./data/timeseries_001",
+    readouts={
+        "lockin_X": (),        # scalar per sample → stored shape (N,)
+        "lockin_Y": (),
+        "S21":      (1601,),   # trace per sample  → stored shape (N, 1601)
+        "frame":    (480, 640) # image per sample  → stored shape (N, 480, 640)
+    },
+    chunk_size=256,            # samples buffered before each disk write
+    dtype="float32",
+    tags=["continuous", "lock-in"],
+    overwrite=True,
+)
+```
+
+At init, all arrays are created with size `0` along the time axis:
+
+| Array | Initial shape | Final shape after N samples |
+|---|---|---|
+| `_time` | `(0,)` | `(N,)` |
+| `lockin_X` | `(0,)` | `(N,)` |
+| `S21` | `(0, 1601)` | `(N, 1601)` |
+| `frame` | `(0, 480, 640)` | `(N, 480, 640)` |
+
+### 12.3 Appending samples
+
+```python
+while instrument.is_running():
+    x, y  = lockin.read_xy()
+    trace = vna.sweep()          # shape (1601,)
+
+    writer.append({
+        "lockin_X": x,
+        "lockin_Y": y,
+        "S21":      trace,
+    })
+```
+
+Each call to `append()` buffers the sample in memory. When the buffer reaches `chunk_size` samples, `flush()` is called automatically — resizing the Zarr arrays and writing the batch in one operation.
+
+You do not have to supply every readout on every call. Readouts omitted from a call are simply not written for that sample, leaving zeros in the pre-allocated region. For sparse acquisition, supply all readouts each call and use `_time` to align them later.
+
+### 12.4 Flushing and closing
+
+`flush()` can be called manually at any time to commit buffered data:
+
+```python
+writer.flush()   # commit whatever is currently buffered
+```
+
+This is useful if you want partial results visible on disk during a long run, or as a safety measure before a risky operation.
+
+`close()` flushes any remaining buffer and writes metadata:
+
+```python
+writer.close(meta={
+    "operator": "alice",
+    "sample":   "chip_B2",
+    "notes":    "terminated after 3000 samples",
+})
+```
+
+`close()` writes both Zarr group attributes and `metadata.yaml`, consistent with `ZarrWriter.write_metadata()`. Always call it at the end of acquisition.
+
+> **Data loss on crash:** samples buffered since the last `flush()` are lost if the process terminates unexpectedly. Set `chunk_size=1` for maximum durability (one disk write per sample, slower), or call `flush()` explicitly at checkpoints.
+
+### 12.5 Reading streaming data
+
+The vault is a standard Zarr v3 group:
+
+```python
+import zarr
+import numpy as np
+from datetime import datetime
+
+z = zarr.open("./data/timeseries_001/vault.zarr", mode="r")
+print(list(z.keys()))
+# ['_time', 'lockin_X', 'lockin_Y', 'S21']
+
+# Timestamps
+times = z["_time"][:]           # shape (N,), Unix float64
+dt    = [datetime.fromtimestamp(t) for t in times]
+
+# Scalar channels
+x = z["lockin_X"][:]            # shape (N,)
+y = z["lockin_Y"][:]
+
+# Trace channel
+traces = z["S21"][:]            # shape (N, 1601)
+last_trace = z["S21"][-1]      # most recent trace, shape (1601,)
+
+# Metadata
+attrs = dict(z.attrs)
+print(attrs["count"])           # total number of samples written
+print(attrs["tags"])
+```
+
+### 12.6 Mixed readout shapes
+
+A single `StreamingWriter` can hold scalars, traces, and images simultaneously:
+
+```python
+writer = StreamingWriter(
+    root="./data/mixed",
+    readouts={
+        "temperature": (),           # thermocouple reading
+        "resistance":  (),           # lock-in output
+        "spectrum":    (1024,),      # spectrometer trace
+        "camera":      (512, 512),   # camera frame
+    },
+    chunk_size=64,
+)
+
+for _ in range(n_steps):
+    writer.append({
+        "temperature": thermo.read(),
+        "resistance":  lockin.read(),
+        "spectrum":    spectrometer.acquire(),
+        "camera":      cam.capture(),
+    })
+
+writer.close()
+```
+
+### 12.7 Manual timestamps
+
+Pass your own timestamps when the acquisition hardware provides them, or when replaying logged data:
+
+```python
+import time
+
+t0 = time.time()
+
+for sample in hardware.stream():
+    writer.append(
+        data={"signal": sample.value},
+        timestamp=sample.hardware_timestamp,   # float, Unix epoch
+    )
+
+writer.close()
+```
+
+If `timestamp` is omitted, `datetime.now().timestamp()` is used.
+
+### 12.8 Readout metadata (ReadoutSpecs)
+
+A plain shape tuple only tells the writer the array shape.  To also record units, component labels or trailing-axis coordinates (for example the frequency axis of a VNA trace), pass a `ReadoutSpecs` instead.  Tuples and `ReadoutSpecs` can be mixed in one dict, and the dict key must equal the spec's `name`:
+
+```python
+from zarro import StreamingWriter, ReadoutSpecs, DataKind, open_vault
+import numpy as np
+
+freqs = np.linspace(4e9, 8e9, 1601)
+writer = StreamingWriter(
+    root="./data/vna_monitor",
+    readouts={
+        "temperature": ReadoutSpecs("temperature", DataKind.SCALAR, unit="K"),
+        "S21": ReadoutSpecs(
+            "S21", DataKind.TRACE, shape=(1601,), unit="dBm",
+            trailing_dims=[{"name": "freq", "unit": "Hz", "values": freqs}],
+        ),
+        "lockin_xy": ReadoutSpecs("lockin_xy", DataKind.TRACE, shape=(2,), unit="V",
+                                  contains=["X", "Y"]),
+        "raw": (16,),                       # a plain shape tuple still works
+    },
+    chunk_size=64,
+    overwrite=True,
+)
+writer.append({"temperature": 4.2, "S21": np.zeros(1601),
+               "lockin_xy": [1.0, 0.1], "raw": np.zeros(16)})
+writer.close()
+
+run = open_vault("./data/vna_monitor")
+run.readouts["S21"].unit                  # "dBm"
+run.trailing_coords["S21"]["freq"]        # the freqs array
+da = run.to_xarray("S21")                 # dims ("time", "freq"), da.attrs["units"] == "dBm"
+run.values("lockin_xy", component="X")    # shape (n_samples,)
+```
+
+The same rules as `ZarrWriter` apply ([§3.3](#33-readoutspecs)): a `contains` list becomes a `component` dimension, numeric `trailing_dims` values are stored as `{readout}.{dim}` arrays in `vault.zarr`, and string labels and per-label `units` are kept in the manifest.  The manifest is written when the writer is created, so units and labels are available even while the run is still open.  Shape and kind are validated when the `ReadoutSpecs` is created; a `ReadoutSpecs` whose name differs from its dict key raises `ValueError`.  Plain tuples are not validated beyond their shape and are inferred as scalar / trace / image by length.
+
+---
+
+## 13. Sharding and Performance
+
+`ZarrWriter` automatically chooses chunk and shard shapes based on `writetype` and `target_file_size_bytes`.
+
+**Chunk shape** is aligned with the write pattern so each write touches exactly one chunk:
+
+| WriteType | Chunk shape (control dims) |
+|---|---|
+| POINTWISE | `(1, 1, …, 1)` |
+| TRACEWISE | `(1, 1, …, N_last)` |
+| IMAGEWISE | `(1, 1, …, N_y, N_x)` |
+| ALL | `control_shape` |
+
+**Shard shape** aggregates multiple chunks into one file, reducing filesystem overhead. The number of shards is estimated from `target_file_size_bytes`:
+
+```
+num_shards = total_bytes // target_file_size_bytes
+```
+
+`total_bytes` uses the `dtype` of the readout data arrays only.  Control-variable coordinate arrays (always float64) are small, are not sharded, and are not part of the estimate.
+
+Tune `target_file_size_bytes` to match your storage system:
+- Local NVMe SSD → 1–5 MB
+- Network-attached storage (NAS) → 10–50 MB
+- Object storage (S3) → 50–200 MB
+
+```python
+writer = ZarrWriter(
+    root="./data/nas_run",
+    schema=schema,
+    target_file_size_bytes=20 * 1024 * 1024,   # 20 MB shards for NAS
+    initialize_arrays=True,
+)
+```
+
+---
+
+## 14. API Reference
+
+### DataKind
+
+```
+DataKind.SCALAR   # single value per point
+DataKind.TRACE    # 1-D array per point
+DataKind.IMAGE    # 2-D array per point
+```
+
+### WriteType
+
+```
+WriteType.POINTWISE   # write one point at a time
+WriteType.TRACEWISE   # write one trace at a time
+WriteType.IMAGEWISE   # write one image plane at a time
+WriteType.ALL         # write entire array at once
+```
+
+### ControlVar
+
+```python
+ControlVar(
+    name: str,
+    values: np.ndarray,
+    unit: str = None,
+    reverse: bool = False,    # doubles array for hysteresis
+    instrument: str = None,
+)
+# Property: .length → int
+# Written to the vault as float64 regardless of the writer's dtype.
+```
+
+### AxisSpecs
+
+```python
+AxisSpecs(controls: list[ControlVar])
+# Property: .length → int
+# Property: .names  → list[str]
+```
+
+### ReadoutSpecs
+
+```python
+ReadoutSpecs(
+    name: str,
+    kind: DataKind,
+    unit: str = None,                       # single unit string for the readout
+    shape: tuple[int, ...] = None,          # required for TRACE and IMAGE
+    contains: str | list[str] = None,       # list auto-promotes to trailing_dims
+    trailing_dims: list[dict] = None,
+    # each dict keys:
+    #   "name":  str           — dimension name
+    #   "unit":  str           — unit for homogeneous axis
+    #   "units": list[str]     — per-label units for component dim
+    #   "values": list | array — coordinate values (numeric → zarr, string → yaml)
+)
+```
+
+### MeasurementSchema
+
+```python
+MeasurementSchema(
+    control: list[AxisSpecs],
+    readout: list[ReadoutSpecs],
+    writetype: WriteType = WriteType.POINTWISE,
+)
+# Property: .axis_names    → dict[str, dict[str, dict]]  e.g. {'axis0': {'power': {'unit': 'dBm'}}}
+# Property: .readout_names → list[str]
+# Property: .meta          → dict  (auto-generated)
+```
+
+### ZarrWriter
+
+```python
+ZarrWriter(
+    root: str | Path,
+    schema: MeasurementSchema = None,
+    tags: list[str] = [],
+    dtype: str = "float32",     # readout data arrays; control coordinates are always float64
+    overwrite: bool = False,
+    initialize_arrays: bool = False,
+    target_file_size_bytes: int = 5*1024*1024,
+)
+
+# Write methods
+writer.write_point(index: tuple, data: dict)
+writer.write_trace(index: tuple, data: dict)
+writer.write_image(index: tuple, data: dict)
+writer.write_all(data: dict)
+
+# Metadata
+writer.write_metadata(meta: dict = None)
+writer.write_yaml(meta: dict = None)
+
+# Array management
+writer.add_array(name: str, value: np.ndarray, meta: dict = None)
+writer.dump(data: dict, meta: dict = None)
+```
+
+### NpzWriter
+
+```python
+NpzWriter(
+    root: str | Path,
+    schema: MeasurementSchema = None,
+    tags: list[str] = [],
+    overwrite: bool = False,
+    compressed: bool = False,
+)
+
+writer.write(data: dict[str, np.ndarray])
+writer.write_metadata(meta: dict = None)
+```
+
+### ExperimentID
+
+```python
+ExperimentID(root: str | Path)
+
+eid.next_id()             → int
+eid.current_id()          → int    # largest id among run folders, 0 if none (see §9)
+eid.next_dir()            → Path   # e.g. ./data/0004
+eid.current_dir()         → Path
+eid.get_dir_name(id)      → Path   # int -> zero-padded (at least 4 digits), str -> as given
+eid.get_folders()         → list[Path]   # all subfolders, listing order unspecified
+```
+
+### StreamingWriter
+
+```python
+StreamingWriter(
+    root: str | Path,
+    readouts: dict[str, tuple | ReadoutSpecs],   # name -> trailing shape, or a ReadoutSpecs (name must match the key)
+    chunk_size: int = 256,
+    dtype: str = "float32",     # readout data arrays; "_time" is always float64
+    tags: list[str] = [],
+    overwrite: bool = False,
+)
+
+writer.append(data: dict, timestamp: float = None)
+writer.flush()
+writer.close(meta: dict = None)
+```
+
+Arrays in vault:
+
+| Name | Shape | dtype | Description |
+|---|---|---|---|
+| `_time` | `(N,)` | float64 | Unix timestamps |
+| `<readout>` | `(N,) + trailing` | dtype | One entry per `readouts` key |
+
+### Utility functions
+
+```python
+encode_value(x)    # numpy array/scalar → JSON-serializable Python type
+serialize(x)       # full JSON encode/decode cycle using encode_value
+compute_sharding(shape: tuple, num_shards: int) → tuple   # compute shard shape
+```
+
+---
+
+### Reader
+
+```python
+from zarro import open_vault, Vault, VaultError
+from zarro.reader import Axis, Readout
+```
+
+#### `open_vault(path)`
+
+Returns `Vault(path)`.  When the exact path does not exist and its final
+component is an experiment ID of four or more digits (e.g. `"0007"`), the parent
+directory is searched for a run folder with that id, named `0007` or
+`0007_suffix` and containing `vault.zarr`, `data.npz` or `metadata.yaml`
+(see [§9](#what-counts-as-a-run-folder)); numbered folders without output are ignored.
+Raises `VaultError` if zero or more than one match is found.
+
+#### `Vault(path, *, control=None, readouts=None)`
+
+Open a run directory for reading.
+
+| Attribute | Type | Description |
+|---|---|---|
+| `kind` | `"sweep"` or `"monitor"` | Determined by presence of `_time` array |
+| `shape` | `tuple[int, ...]` | Grid shape, or `(n_samples,)` for monitors |
+| `metadata` | `dict` | zarr attrs merged with `metadata.yaml` |
+| `tags` | `list[str]` | |
+| `axes` | `dict[str, Axis]` | Keyed by variable name; empty for monitors |
+| `readouts` | `dict[str, Readout]` | One entry per data array |
+| `time` | `np.ndarray` | Unix timestamps (monitors only) |
+| `dim_names` | `list[str]` | Dimension role names for all grid dims, e.g. `["step", "sweep"]` |
+
+Methods:
+
+```python
+vault.read(name, selection=Ellipsis, *, component=None) → np.ndarray  # 0.0 at unwritten
+vault.values(name, *, component=None) → np.ndarray                    # NaN at unwritten
+vault.written_mask(name, order=None) → np.ndarray                     # bool grid
+vault.snapshot()                                                        # print summary
+vault.to_xarray(
+    name,
+    *,
+    component=None,              # select one named layer (removes layer dim)
+    trailing_coords=None,        # {dim_name: array} — supply coords for old vaults
+) → xr.DataArray
+
+# component= works for any readout with a "component" trailing_dim (or contains-as-list).
+# trailing_coords= is a fallback for vaults written without trailing_dims in ReadoutSpecs.
+# da.attrs["component_units"] is set when trailing_dims carries a "units" list.
+# Monitor runs get a leading "time" dim (coord = raw Unix seconds).
+# to_xarray raises ImportError when xarray is not installed.
+```
+
+#### `Axis`
+
+```python
+@dataclass
+class Axis:
+    name: str
+    values: np.ndarray        # coordinate array, shape (length,)
+    unit: str | None
+    length: int
+    dim: int                  # grid dimension this variable spans
+```
+
+Variables on a multi-control axis share the same ``dim`` value.
+
+#### `Readout`
+
+```python
+@dataclass(frozen=True)
+class Readout:
+    name: str
+    kind: str                           # "scalar" | "trace" | "image"
+    shape: tuple[int, ...]              # trailing shape; () for scalar
+    unit: str | list[str] | None
+    contains: str | list[str] | None
+    trailing_dims: tuple[str, ...]      # ordered dim names, e.g. ("freq",) or ("component", "freq")
+```
+
+#### `VaultError`
+
+Raised when the directory is not a readable zarro run, a required array is
+missing, or metadata cannot be parsed without fallback arguments.
+
+---
+
+## 15. Version Management
+
+Versioning is handled automatically by [setuptools-scm](https://setuptools-scm.readthedocs.io/). The version is derived from git tags — there is no version string to maintain manually in the source code.
+
+### Checking the current version
+
+```python
+import zarro
+print(zarro.__version__)
+```
+
+### Version string format
+
+| Situation | Example |
+|---|---|
+| Exactly on a tag | `0.2.0` |
+| Commits ahead of a tag | `0.2.1.dev4+gabcd1234` |
+| Uncommitted changes present | `0.2.1.dev4+gabcd1234.d20261112` |
+
+### Releasing a new version
+
+```bash
+# 1. Finish and commit all changes
+git add -A && git commit -m "release v0.3.0"
+
+# 2. Create the tag
+git tag v0.3.0
+
+# 3. Push branch and tag
+git push --follow-tags
+
+# 4. Reinstall locally so _version.py is regenerated
+pip install -e .
+
+# 5. Verify
+python -c "import zarro; print(zarro.__version__)"  # → 0.3.0
+```
+
+> **Note:** step 4 (reinstall) is only needed locally after tagging. Regular code edits are picked up immediately by the editable install without any reinstall.
+
+### Why --follow-tags?
+
+`git push` alone sends branch commits but never tags. `--follow-tags` pushes the branch and any tags reachable from it in one command. You can make this the default permanently:
+
+```bash
+git config --global push.followTags true
+```
+
+After that, plain `git push` does everything.

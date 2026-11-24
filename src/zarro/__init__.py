@@ -1,4 +1,5 @@
-from .core2 import (
+from ._version import __version__
+from .core import (
     DataKind,
     WriteType,
     ControlVar,
@@ -7,10 +8,13 @@ from .core2 import (
     MeasurementSchema,
     ZarrWriter,
     NpzWriter,
-    ExperimentID
+    ExperimentID,
+    StreamingWriter
 )
+from .reader import Vault, VaultError, open_vault
 
 __all__ = [
+    "__version__",
     "DataKind",
     "WriteType",
     "ControlVar",
@@ -19,5 +23,9 @@ __all__ = [
     "MeasurementSchema",
     "ZarrWriter",
     "NpzWriter",
-    "ExperimentID"
+    "ExperimentID",
+    "StreamingWriter",
+    "Vault",
+    "VaultError",
+    "open_vault",
 ]

@@ -1,0 +1,150 @@
+CHANGES
+=======
+
+[2026-11-14]
+- core: ExperimentID.current_id() no longer depends on directory listing order or on unrelated
+  folders. It is now the largest id among run folders, 0 if none (no more len(folders) floor).
+  Fixes: ValueError on a non-numeric folder listed last, "2026_backup" giving id 2026, and an
+  unsorted listing returning an existing id (ContainsArrayError at run start).
+  * run folder = subfolder named NNNN or NNNN_suffix (four or more digits, no extra leading
+    zeros) containing vault.zarr (dir), data.npz or metadata.yaml, so NpzWriter runs count;
+    ids are compared numerically (10000 > 9999) and ids above 9999 work
+  * a numbered folder without output is not a run, so its id is reused
+  * candidates are checked from the highest id down, so typically one or two stats on a NAS
+  * next_id/next_dir/current_dir/get_dir_name/get_folders keep their signatures
+- core/reader: new shared helper zarro/_runs.py; open_vault(".../0007") uses the same rule
+  (previously any folder named 0007 or 0007_*, four digits only), so numbered folders without
+  output such as "2026_backup" no longer match and ids of five or more digits resolve
+- docs: §9 documents the run-folder rule and its consequences; fixed the "typical usage" example,
+  which recorded next_id() after the folder had been created (off by one); §14 updated
+- core: ZarrWriter stores control-variable coordinate arrays as float64 regardless of the
+  writer's dtype (readout data arrays keep dtype, default float32). float32 merged distinct
+  GHz-scale sweep points (5.123456789e9 and 5.123456790e9 were stored as the same value).
+  Covers single and multi-control axes and ControlVar(reverse=True); trailing_dims arrays
+  (keep their own dtype), "_time" (float64) and StreamingWriter are unchanged; shard-size
+  estimates still use the readout dtype only.
+  * vaults written earlier keep their float32 coordinates (already rounded, not recoverable);
+    Vault reads whatever dtype is stored
+  * a readout that holds frequencies as data (e.g. an "fpts" layer) still uses the writer dtype
+- docs: §3.1 coordinate precision (with example), §4.1/§13/§14 dtype wording
+- core: StreamingWriter accepts a ReadoutSpecs per readout (mixed with plain shape tuples);
+  unit, contains and trailing_dims are recorded in the attrs["zarro"] manifest at init, numeric
+  trailing_dims values are written as "{readout}.{dim}" arrays, and the reader reports them
+  (Readout.unit, trailing_coords/trailing_units, to_xarray labels and units) for monitor runs.
+  A ReadoutSpecs name must match its dict key (ValueError). Tuple usage is unchanged.
+- core: ReadoutSpecs now validates itself at construction (ValueError): kind/shape consistency
+  (scalar (), trace 1-D, image 2-D), trailing_dims count and value/unit lengths, duplicate names.
+  The contains-list promotion moved from MeasurementSchema into ReadoutSpecs.__post_init__ and
+  applies only to trace/image readouts; string-array labels become lists; caller dicts are copied.
+  ZarrWriter, MeasurementSchema.manifest and StreamingWriter share _write_trailing_coords and
+  _readout_manifest instead of duplicating that logic.
+- reader: fix snapshot() crashing on readouts whose contains/unit is a list (plain-text table
+  now joins list cells)
+- docs: §3.3 validation rules, new §12.8 Readout metadata, §6.4 and §14 updated
+- reader: to_xarray() on monitor runs now has a leading "time" dimension whose coordinate is
+  the raw Unix timestamps (attrs["units"] = "s (unix epoch)"); grid logic factored into
+  Vault._grid_dims_and_coords()
+- core: fix ControlVar(reverse=True) raising FrozenInstanceError (values were assigned on a
+  frozen dataclass); values are now forward then backward as documented. Added tests.
+- docs: every python example in docs.md §1-§13 was executed against stub hardware and
+  purpose-built vaults; fixed: §4.3 tracewise example (used a TRACE readout with a per-row
+  write of the wrong shape; now SCALAR), §3.4/§14 axis_names output, §8.8 missing Vault
+  import, §9 now uses ./experiments (a numeric-only folder scan breaks on ./data/run_001),
+  §8.7 monitor to_xarray + manifest wording
+- core: writers store a normalized manifest in vault.zarr attributes under "zarro"
+  ({version, kind, axes[{name,dim,unit}], readouts[{name,kind,shape,unit,contains,trailing_dims}]})
+  * ZarrWriter writes it at init (and in write_metadata); StreamingWriter at init
+  * MeasurementSchema.manifest property builds it
+  * write_metadata/close/dump now merge into zarr attrs (attrs.update) instead of
+    replacing them, so the manifest is preserved
+  * existing data layout, metadata.yaml and attrs content are unchanged
+- reader: Vault reads structure from the manifest; _load_axes/_load_readouts replaced by
+  _build_axes/_build_readouts, and all old-format handling moved into _legacy_manifest()
+  (used only for vaults without a manifest; control=/readouts= fallbacks still apply there)
+  * a run can now be opened mid-sweep without metadata.yaml
+  * "zarro" key is hidden from Vault.metadata
+- docs: new §6.4 Vault manifest; §8.8 clarifies the fallback is for older vaults
+- reader: snapshot() no longer uses tabulate; always prints its built-in plain-text tables
+  (docs §8.1 example output updated to match the new format)
+- core/reader: simplified (ExperimentID dir naming, _write/write_all indexing, _stored_chunks via rglob,
+  removed NpzWriter._control_shape and unused imports)
+- core: ReadoutSpecs.unit is now str only; list[str] removed (per-component units
+  go in trailing_dims as "units" key)
+- core: contains-as-list auto-promotes to trailing_dims=[{"name":"component","values":...}]
+  in MeasurementSchema.__post_init__; old code using contains=["X","Y"] continues to work
+- core: _keep_in_meta moved to module level (was re-defined every loop iteration)
+- core/reader: trailing_dims dict now supports "units": list[str] for per-component units;
+  Vault.trailing_units loaded on open; to_xarray attaches da.attrs["component_units"]
+  as a {label: unit} dict when present
+- reader: _select_component falls back to trailing_coords["component"] when contains
+  is None, so component= selection works without an explicit contains list
+- reader: fix _select_component layer_axis for TRACE readouts with shape=(N,)
+  and contains as a list; previously used hardcoded data.ndim-2 (IMAGE assumption),
+  now uses data.ndim - len(r.shape) so TRACE layers are selected correctly
+- docs: document trailing_dims in ReadoutSpecs (§3.3, §14), to_xarray trailing_coords=
+  kwarg (§8.5, §14), Vault.dim_names property (§14), sweep/step/frame/volume roles
+  in snapshot() example (§8.1), and Readout.trailing_dims field (§14)
+- docs: §3.3 updated — unit is string only, contains-as-list shorthand documented,
+  "units" key in trailing_dims documented with per-label unit example; §5.2, §5.3,
+  §8.4, §8.5, §14 updated to match
+
+[2026-11-12]
+- reader: added Vault / open_vault / VaultError / Axis / Readout (src/zarro/reader.py)
+  * sweep and monitor (StreamingWriter) vaults
+  * written_mask with chunk-file mask (scalar) and non-zero heuristic (sharded trace/image)
+  * order-prefix propagation so genuine 0.0 inside scanned region stays visible
+  * custom visiting order via written_mask(..., order=array)
+  * values() returns NaN at unwritten grid points
+  * fallback control/readouts kwargs when metadata.yaml is gone
+  * backward-compatible with old list-format axis metadata
+- core: control variable units stored in new dict format {"Vch": {"unit": "V"}}
+  (reader handles both old list format and new dict format)
+- tests: added tests/test_reader.py with comprehensive reader coverage
+- docs: rewrote section 8 "Reading Data" (8 subsections) and added reader API to section 14
+- core/reader: trailing dimension labeling for to_xarray()
+  * ReadoutSpecs.trailing_dims — ordered list of {name, unit, values} dicts
+  * ZarrWriter writes numeric trailing coord arrays as "{readout}.{dim_name}"
+    in vault.zarr; string labels (e.g. component names) stay in metadata.yaml
+  * Vault.trailing_coords — {readout_name: {dim_name: np.ndarray}} loaded on open
+  * Readout.trailing_dims — tuple of dim name strings
+  * to_xarray() layered fallback: vault trailing_dims → trailing_coords= kwarg
+    → contains-as-list → generic "sample"/"row"/"col"
+  * to_xarray() now accepts trailing_coords= kwarg for older vaults
+  * contains as list → "component" dim with coordinate labels (priority 3)
+- reader: sweep/step/frame/volume dimension naming
+  * _dim_name(d) helper maps grid dimension index to role name
+  * Axis.dim_name property: "sweep", "step", "frame", "volume"
+  * Vault.dim_names property: ordered list for all grid dims
+  * snapshot() header now shows e.g. "2D step sweep"; axis table shows role column
+  * repr() updated to match
+- reader: added Vault.to_xarray(name, *, component=None) — wraps a readout as
+  an xarray.DataArray with labeled coordinates, units in .attrs, and NaN at
+  unwritten points; raises ImportError when xarray is not installed
+- reader: open_vault now accepts a 4-digit experiment ID; searches the parent
+  directory for a folder whose name starts with that ID (e.g. "0007_blabla"
+  matches "0007"); raises VaultError on no match or ambiguous match
+- reader: added Vault.snapshot() — plain-text summary (kind, shape, date, tags,
+  control axes with units, readouts with kind/shape/unit/contains); plain-text fallback
+
+[2026-11-11]
+- tests: renamed TestWriteNpzlike → TestDump; replaced write_npzlike() calls
+  with dump() to match the actual ZarrWriter API
+
+[2026-11-11] cedc6e7
+- Added StreamingWriter class (append-only open-ended time-series writer)
+- Updated README
+- Added comprehensive tutorials/TUTORIAL.md
+
+[2026-11-11] b493985
+- ControlVar: added reverse field for hysteresis sweeps (doubles the values
+  array by appending its reversed copy)
+
+[2026-11-11] c87cf3f
+- ControlVar: added length property
+
+[2026-11-11] c65fda3
+- Bug fixes
+
+[2026-11-11] b145f5f
+- Added ExperimentID class for auto-incrementing numbered experiment directories
+- Minor bug fixes

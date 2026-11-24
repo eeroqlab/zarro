@@ -79,7 +79,7 @@ s21 = z["S21"][:]           # numpy array, shape (20, 1601)
 
 ## Documentation
 
-See [tutorials/TUTORIAL.md](tutorials/TUTORIAL.md) for a comprehensive guide covering all write patterns, data kinds, metadata management, experiment ID tracking, and the NPZ writer.
+See [docs/docs.md](docs/docs.md) for a comprehensive guide covering all write patterns, data kinds, metadata management, experiment ID tracking, and the NPZ writer.
 
 ## License
 

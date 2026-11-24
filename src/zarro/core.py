@@ -1,18 +1,23 @@
 import yaml
+import warnings
 import numpy as np
 import zarr
 import json
 
+from datetime import datetime
 from enum import StrEnum
 from typing import Optional
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
+from ._runs import latest_run_id, list_dirs
+
 
 def encode_value(x):
     if isinstance(x, np.ndarray):
         return x.tolist()
-    # other special cases... 
+    if isinstance(x, np.generic):  # numpy scalars (np.float32, np.int64, etc.)
+        return x.item()
     return x
 
 
@@ -37,14 +42,23 @@ class ControlVar:
     name: str
     values: np.ndarray
     unit: Optional[str] = None
+    reverse: Optional[bool] = False  # Whether the control variable is swept backwards (e.g. for hysteresis measurements); this is just metadata and does not affect the order of values in the array
     instrument: Optional[str] = None  # Optional field to specify the instrument/source of the control variable
+    
+    @property
+    def length(self):
+        return len(self.values)
+    
+    def __post_init__(self):
+        if self.reverse:  # frozen dataclass: assign via object.__setattr__
+            object.__setattr__(self, "values", np.concatenate([self.values, self.values[::-1]]))
 
 
 @dataclass(slots=True)
 class AxisSpecs:
     """
     Defines a control axis for the measurement schema, consisting of one or more control variables that share the same length (number of points).
-   
+
     Args:
         controls: list of ControlVar instances that define the control variables for this axis.
             All ControlVar instances in the list must have the same length (number of points) to ensure consistent indexing along this axis.
@@ -53,11 +67,14 @@ class AxisSpecs:
     length: int = field(init=False)
 
     def __post_init__(self):
-        assert len(self.controls) > 0, "At least one control variable is required"
+        # FIX: replaced assert with ValueError so validation isn't stripped by python -O
+        if len(self.controls) == 0:
+            raise ValueError("At least one control variable is required")
         length_list = [len(c.values) for c in self.controls]
-        assert len(set(length_list)) <= 1  # Returns True if all elements in items are equal, False otherwise.
+        if len(set(length_list)) > 1:
+            raise ValueError(f"All ControlVar instances must have the same length, got: {length_list}")
         self.length = length_list[0] if length_list else 0
-    
+
     @property
     def names(self) -> list[str]:
         return [c.name for c in self.controls]
@@ -69,13 +86,107 @@ class ReadoutSpecs:
     kind: DataKind
     unit: Optional[str] = None
     shape: Optional[tuple[int, ...]] = None  # For trace/array data, specify the shape of the trailing dimensions (e.g. trace length or image height/width)
-    contains: Optional[str] = None
+    contains: Optional[str | list[str]] = None
+    trailing_dims: Optional[list[dict]] = None
+    # trailing_dims: ordered list of dicts describing trailing dimensions, e.g.:
+    #   [{"name": "component", "values": ["mag", "phase"], "units": ["Hz", "dBm"]},
+    #    {"name": "freq", "unit": "Hz", "values": np.linspace(4e9, 8e9, 1601)}]
+    # Numeric value arrays are stored in vault.zarr as "{readout_name}.{dim_name}".
+    # String value arrays (e.g. component labels) go into metadata only.
+    # "units" (list) on a component dim gives per-label units; exposed in to_xarray attrs.
+
+    def __post_init__(self):
+        self.kind = DataKind(self.kind)
+        if self.shape is not None:
+            self.shape = tuple(self.shape)
+        shape = self.shape or ()
+        ndim = {DataKind.SCALAR: 0, DataKind.TRACE: 1, DataKind.IMAGE: 2}[self.kind]
+        if len(shape) != ndim:
+            raise ValueError(
+                f"readout '{self.name}': kind '{self.kind}' needs a {ndim}-D shape, got shape={self.shape}"
+            )
+
+        # contains as a list of labels on a trace/image is shorthand for a component dim
+        if isinstance(self.contains, list) and self.trailing_dims is None and shape:
+            self.trailing_dims = [{"name": "component", "values": list(self.contains)}]
+        if self.trailing_dims is None:
+            return
+
+        if len(self.trailing_dims) > len(shape):
+            raise ValueError(
+                f"readout '{self.name}': {len(self.trailing_dims)} trailing_dims for shape {self.shape}"
+            )
+        dims = []
+        for i, td in enumerate(self.trailing_dims):
+            if not isinstance(td, dict) or not isinstance(td.get("name"), str):
+                raise ValueError(f"readout '{self.name}': each trailing_dims entry needs a string 'name'")
+            td = dict(td)
+            if td.get("values") is not None:
+                arr = np.asarray(td["values"])
+                if arr.ndim != 1 or len(arr) != shape[i]:
+                    raise ValueError(
+                        f"readout '{self.name}': trailing dim '{td['name']}' has values of shape "
+                        f"{arr.shape}, expected ({shape[i]},)"
+                    )
+                if arr.dtype.kind in "US":
+                    td["values"] = arr.tolist()
+            if td.get("units") is not None:
+                if not isinstance(td["units"], (list, tuple)) or len(td["units"]) != shape[i]:
+                    raise ValueError(
+                        f"readout '{self.name}': trailing dim '{td['name']}' needs {shape[i]} units"
+                    )
+                td["units"] = list(td["units"])
+            dims.append(td)
+        names = [td["name"] for td in dims]
+        if len(set(names)) != len(names):
+            raise ValueError(f"readout '{self.name}': duplicate trailing dim names {names}")
+        self.trailing_dims = dims
+
+
+def _keep_in_meta(k: str, v) -> bool:
+    """Return True if a trailing_dim key-value pair should be stored in metadata.yaml."""
+    if k != "values":
+        return True
+    if isinstance(v, (list, tuple)):
+        return bool(v) and isinstance(v[0], str)
+    return False  # numpy array → goes in zarr
+
+
+def _meta_trailing_dims(spec: ReadoutSpecs) -> list[dict]:
+    """trailing_dims as stored in metadata: numeric value arrays are left out (they live in zarr)."""
+    return [{k: v for k, v in td.items() if _keep_in_meta(k, v)} for td in spec.trailing_dims or []]
+
+
+def _readout_manifest(spec: ReadoutSpecs) -> dict:
+    return {
+        "name": spec.name,
+        "kind": str(spec.kind),
+        "shape": list(spec.shape or ()),
+        "unit": spec.unit,
+        "contains": spec.contains,
+        "trailing_dims": _meta_trailing_dims(spec),
+    }
+
+
+def _write_trailing_coords(group, spec: ReadoutSpecs, overwrite: bool) -> None:
+    """Store numeric trailing-dim coordinates as "{readout}.{dim}" arrays; string labels stay in metadata."""
+    for td in spec.trailing_dims or []:
+        values = td.get("values")
+        if values is None:
+            continue
+        values = np.asarray(values)
+        if not np.issubdtype(values.dtype, np.number):
+            continue
+        arr = group.create_array(
+            name=f"{spec.name}.{td['name']}", shape=values.shape, dtype=values.dtype, overwrite=overwrite
+        )
+        arr[:] = values
 
 
 @dataclass(slots=True)
 class MeasurementSchema:
     """Defines the structure of the measurement, including control axes and readout specifications.
-    
+
     Args:
         control: list of AxisSpec instances that define the control axes for the measurement.
             Each AxisSpec instance must have a consistent length across its ControlVar instances.
@@ -90,21 +201,33 @@ class MeasurementSchema:
     meta: dict = field(init=False)
 
     @property
-    def axis_names(self) -> list[str]:
+    def axis_names(self) -> dict:
         names = {}
         for i, axis in enumerate(self.control):
-            names["axis" + str(i)] = axis.names
+            names["axis" + str(i)] = {c.name: {"unit": c.unit} for c in axis.controls}
         return names
-    
+
     @property
     def readout_names(self) -> list[str]:
         return [r.name for r in self.readout]
-    
+
+    @property
+    def manifest(self) -> dict:
+        """Normalized structure stored in the vault so the reader needs no format guessing."""
+        axes = [
+            {"name": c.name, "dim": d, "unit": c.unit}
+            for d, ax in enumerate(self.control) for c in ax.controls
+        ]
+        readouts = [_readout_manifest(r) for r in self.readout]
+        return {"version": 2, "kind": "sweep", "axes": axes, "readouts": readouts}
+
     def __post_init__(self):
         readout_meta = {}
         for r in self.readout:
             specs = asdict(r)
             specs.pop("name")
+            if r.trailing_dims:
+                specs["trailing_dims"] = _meta_trailing_dims(r)
             readout_meta[r.name] = specs
 
         self.meta = {
@@ -113,13 +236,43 @@ class MeasurementSchema:
         }
 
 
+@dataclass
+class ExperimentID:
+    root: Path | str
+    
+    def __post_init__(self):
+        self.root = Path(self.root)
+        self.root.mkdir(parents=True, exist_ok=True)
+    
+    def get_folders(self):
+        """All subfolders of root, in listing order (unspecified)."""
+        return list_dirs(self.root)
+
+    def current_id(self):
+        """Largest id among run folders (``0007`` or ``0007_suffix`` holding a vault.zarr,
+        data.npz or metadata.yaml); 0 if there are none."""
+        return latest_run_id(self.get_folders())
+
+    def next_id(self):
+        return self.current_id() + 1   
+
+    def next_dir(self):
+        return self.get_dir_name(self.next_id())
+
+    def current_dir(self):
+        return self.get_dir_name(self.current_id())
+
+    def get_dir_name(self, id: int | str):
+        return self.root / (id if isinstance(id, str) else f"{id:04d}")
+
+
 def compute_sharding(shape: tuple[int, ...], num_shards: int) -> tuple[int, ...]:
     """Compute shard shape given total array shape and desired number of shards.
-    
+
     Args:
         shape: full shape of the array to be sharded
         num_shards: desired number of shards to split the array into
-    
+
     Returns:
         shard_shape: shape of each shard, computed to approximately meet the target shard size
     """
@@ -134,7 +287,7 @@ def compute_sharding(shape: tuple[int, ...], num_shards: int) -> tuple[int, ...]
             Si = 1
             shard_shape.append(Si)
             escape_S = escape_S * Ni
-    
+
     if len(shard_shape) < len(shape):
         shard_shape.extend(shape[len(shard_shape):])
 
@@ -152,6 +305,8 @@ class ZarrWriter:
             The writer uses this schema to initialize the Zarr arrays and
             optimize chunking/sharding strategies based on the writetype.
         tags (list[str]): optional list of tags to categorize or annotate the measurement.
+        dtype (str): numpy dtype string for readout data arrays (default "float32"). Used for array creation and shard size estimation.
+            Control-variable coordinate arrays are always stored as float64, so GHz-scale sweep points stay distinct.
         target_file_size_bytes (int): desired shard file size in bytes (default 1MB); used to compute shard shapes for trace/array data
         overwrite (bool): if True, existing data will be overwritten; otherwise, it will be preserved and verified for consistency
         initialize_arrays (bool): if True, Zarr arrays will be created at initialization based on the schema.
@@ -171,6 +326,7 @@ class ZarrWriter:
     tags: list[str] = field(default_factory=list)
 
     # Behavior
+    dtype: str = "float32"  # readout data arrays only (and their shard-size estimate); coordinates are float64
     overwrite: bool = False
     initialize_arrays: bool = False  # Whether to create Zarr arrays at initialization based on the schema. If False, arrays can be created later using add_array().
     target_file_size_bytes: int = 5 * 1024 * 1024  # target ~5MB shards; adjust as needed
@@ -192,6 +348,7 @@ class ZarrWriter:
             # Create/open arrays
             self._init_coord_arrays()
             self._init_data_arrays()
+            self.vault.attrs["zarro"] = serialize(self.schema.manifest)
             # Write a small manifest (you can expand with full experiment metadata)
             self.write_yaml()
 
@@ -203,21 +360,21 @@ class ZarrWriter:
                 arr = self.vault.create_array(
                     name=var.name,
                     shape=var.values.shape,
-                    dtype="float32",
+                    dtype="float64",  # float32 would merge distinct GHz-scale sweep points
                     overwrite=self.overwrite,
                 )
                 arr[:] = np.asarray(var.values)
-    
+
 
     def _init_data_arrays(self):
         """Initialize data arrays for measurement readouts."""
 
         for readout in self.schema.readout:
-            
+
             match readout.kind:
                 case DataKind.SCALAR:
                     shape = self._control_shape
-                    shard_shape = None # self._get_shard_shape(shape, data_kind=DataKind.SCALAR)
+                    shard_shape = None
                     chunk_shape = self._get_chunk_shape()
 
                 case DataKind.TRACE:
@@ -227,7 +384,16 @@ class ZarrWriter:
                     else:
                         shard_shape = self._get_shard_shape(shape, data_kind=DataKind.TRACE)
                     chunk_shape = self._get_chunk_shape() + (readout.shape[0],)
-                
+                    
+                # FIX: IMAGE was previously unhandled (raised NotImplementedError)
+                case DataKind.IMAGE:
+                    shape = self._control_shape + readout.shape  # readout.shape is (H, W)
+                    if self.schema.writetype == WriteType.ALL:
+                        shard_shape = None
+                    else:
+                        shard_shape = self._get_shard_shape(shape, data_kind=DataKind.IMAGE)
+                    chunk_shape = self._get_chunk_shape() + readout.shape
+
                 case _:
                     raise NotImplementedError(f"Unsupported measurement kind: {readout.kind}")
 
@@ -236,9 +402,11 @@ class ZarrWriter:
                 shape=shape,
                 shards=shard_shape,
                 chunks=chunk_shape,
-                dtype="float32",
+                dtype=self.dtype,  # FIX: use self.dtype instead of hardcoded "float32"
                 overwrite=self.overwrite,
             )
+
+            _write_trailing_coords(self.vault, readout, self.overwrite)
 
 
     def _get_chunk_shape(self) -> tuple[int, ...]:
@@ -255,8 +423,10 @@ class ZarrWriter:
                 return (1,) * (len(shape) - 1) + (shape[-1],)
 
             case WriteType.IMAGEWISE:
-                assert len(shape) > 1, "Control shape must have at least two dimensions for imagewise writes"
-                return (1,) * (len(shape) - 2) + (shape[-1], shape[-2])
+                # FIX: replaced assert with ValueError so validation isn't stripped by python -O
+                if len(shape) <= 1:
+                    raise ValueError("Control shape must have at least two dimensions for imagewise writes")
+                return (1,) * (len(shape) - 2) + (shape[-2], shape[-1])
 
             case WriteType.ALL:
                 return shape
@@ -269,8 +439,9 @@ class ZarrWriter:
         # Compute the total number of elements in the array
         total_elements = np.prod(shape)
 
-        # Compute the number of shards needed to meet the target shard size
-        num_shards = max(1, total_elements * 4 // self.target_file_size_bytes)
+        # FIX: use actual dtype itemsize instead of hardcoded 4 (which assumed float32)
+        itemsize = np.dtype(self.dtype).itemsize
+        num_shards = max(1, total_elements * itemsize // self.target_file_size_bytes)
 
         match self.schema.writetype:
             case WriteType.POINTWISE:
@@ -282,21 +453,30 @@ class ZarrWriter:
             case WriteType.IMAGEWISE:
                 index = slice(None, -2)
                 outro = slice(-2, None)
+            # FIX: WriteType.ALL was missing, causing UnboundLocalError if reached
+            case WriteType.ALL:
+                return shape  # no sharding needed for full writes
 
         match data_kind:
             case DataKind.SCALAR:
                 true_shape = shape
                 shard_shape = compute_sharding(true_shape[index], num_shards)
                 shard_shape += true_shape[outro]
-                
+
             case DataKind.TRACE:
                 true_shape = shape[:-1]  # control dims only
                 shard_shape = compute_sharding(true_shape[index], num_shards)
                 shard_shape += true_shape[outro] + (shape[-1],)
 
+            # FIX: IMAGE was missing from this match (needed for _init_data_arrays IMAGE case)
+            case DataKind.IMAGE:
+                true_shape = shape[:-2]  # control dims only
+                shard_shape = compute_sharding(true_shape[index], num_shards)
+                shard_shape += true_shape[outro] + shape[-2:]
+
         return shard_shape
 
-    
+
     def _write(self, index: tuple[int, ...], data: dict[str, np.ndarray], writetype: WriteType):
         """Generalized write method that dispatches based on writetype."""
 
@@ -310,33 +490,20 @@ class ZarrWriter:
             case _:
                 raise ValueError(f"Unsupported writetype: {writetype}")
 
+        # FIX: error message said "- 1" regardless of writetype; now uses actual num_slices
         if len(index) != len(self._control_shape) - num_slices:
-            raise ValueError(f"index length {len(index)} does not match control dims {len(self._control_shape) - 1}")
-    
-        datakind_by_name = {r.name: r.kind for r in self.schema.readout}
+            raise ValueError(f"index length {len(index)} does not match control dims {len(self._control_shape) - num_slices}")
 
         # Write each dataset
         for name, value in data.items():
             if name not in self.vault:
                 raise KeyError(f"Unknown dataset '{name}'")
-            
+
             arr = self.vault[name]
             value = np.asarray(value, dtype=arr.dtype)
 
-            match datakind_by_name[name]:
-                case DataKind.SCALAR:
-                    # self._check_input_shape(value, (), name)
-                    index_tuple = index + (slice(None),) * (num_slices + 0)
-
-                case DataKind.TRACE:
-                    # self._check_input_shape(value, (arr.shape[-1],), name)
-                    index_tuple = index + (slice(None),) * (num_slices + 1)
-
-                case DataKind.IMAGE:
-                    # self._check_input_shape(value, arr.shape[-2:], name)
-                    index_tuple = index + (slice(None),) * (num_slices + 2)
-            
-            arr[index_tuple] = value
+            self._check_input_shape(value, arr.shape[len(index):], name)
+            arr[index] = value
 
 
     def write_point(self, index: tuple[int, ...], data: dict[str, np.ndarray]):
@@ -356,13 +523,12 @@ class ZarrWriter:
         for name, value in data.items():
             if name not in self.vault:
                 raise KeyError(f"Unknown dataset '{name}'")
-            
+
             arr = self.vault[name]
             value = np.asarray(value, dtype=arr.dtype)
             self._check_input_shape(value, arr.shape, name)
 
-            index_tuple = (slice(None),) * len(arr.shape)
-            arr[index_tuple] = value
+            arr[...] = value
 
 
     def _check_input_shape(self, value: np.ndarray, expected_shape: tuple[int, ...], name: str):
@@ -373,18 +539,20 @@ class ZarrWriter:
     def write_yaml(self, meta: dict[str, str] = None):
         """Write a simple YAML manifest with experiment metadata, including control axis names and readout names.
         This is separate from the Zarr attributes and can be used for quick inspection or compatibility with other tools.
-        
+
         Args:
             meta: additional metadata to include in the YAML file, as a dictionary of key-value pairs.
             This can be used to add custom metadata fields beyond the standard control and readout information.
         """
         metadata_path = self.root / "metadata.yaml"
+        # FIX: was silently skipping without any indication; now emits a warning
         if metadata_path.exists() and not self.overwrite:
+            warnings.warn(f"Metadata file already exists at {metadata_path} and overwrite=False; skipping write.")
             return
-        
+
         metadata = {"tags": self.tags}
-        if self.schema is not None:    
-            metadata |= self.schema.meta 
+        if self.schema is not None:
+            metadata |= self.schema.meta
         if meta:
             metadata |= meta  # Merge additional metadata if provided
 
@@ -396,21 +564,23 @@ class ZarrWriter:
         Write experiment metadata as Zarr group attributes. This can include control axis names, readout names,
         and any additional metadata provided by the user.
         Zarr attributes are stored as JSON-serializable key-value pairs and can be accessed programmatically when reading the Zarr group,
-        making them useful for storing structured metadata alongside the data arrays. 
+        making them useful for storing structured metadata alongside the data arrays.
 
         Args:
             meta: additional metadata to include in the Zarr attributes, as a dictionary of key-value pairs.
                 This can be used to add custom metadata fields beyond the standard control and readout information.
         """
         metadata = {
-            "date": str(self.root),
+            "date": datetime.now().isoformat(),  # FIX: was str(self.root), which stored the path not the date
             "schema": self.schema.meta if self.schema is not None else "none",
             "tags": self.tags
         }
         if meta:
             metadata |= meta  # Merge additional metadata if provided
+        if self.schema is not None:
+            metadata["zarro"] = self.schema.manifest  # also covers initialize_arrays=False
         metadata = serialize(metadata)
-        self.vault.attrs.put(metadata)  # Store metadata as a single JSON string in Zarr attributes; can be parsed back into structured form when reading
+        self.vault.attrs.update(metadata)  # update, not put: keeps the attrs["zarro"] manifest
         self.write_yaml(meta)  # Also write a human-readable YAML manifest
 
 
@@ -431,9 +601,10 @@ class ZarrWriter:
         arr[:] = value
 
 
-    def write_npzlike(self, data: dict[str, np.ndarray], meta: dict[str, dict] = None):
+    def dump(self, data: dict, meta: dict = None):
+        self.vault.attrs.update(meta or {})
         for key, value in data.items():
-            self.add_array(name=key, value=value, meta=meta)
+            self.add_array(name=key, value=value)
 
 
 @dataclass
@@ -448,19 +619,13 @@ class NpzWriter:
     overwrite: bool = False
     compressed: bool = False
 
-    # Not user controlled
-    _control_shape: tuple[int, ...] = field(init=False)
-
     def __post_init__(self):
         self.root = Path(self.root)
         self.root.mkdir(parents=True, exist_ok=True)
 
-        if self.schema is not None:
-            self._control_shape = tuple(ax.length for ax in self.schema.control)
-
 
     def write(self, data: dict[str, np.ndarray]):
-        filename = self.root / f"data.npz"
+        filename = self.root / "data.npz"  # FIX: removed unnecessary f-string prefix
         if self.overwrite and filename.exists():
             filename.unlink()  # Remove existing file if overwrite is True
         if self.compressed:
@@ -471,11 +636,157 @@ class NpzWriter:
 
     def write_metadata(self, meta: dict = None):
         metadata_path = self.root / "metadata.yaml"
-        
+
         metadata = {"tags": self.tags}
-        if self.schema is not None:    
-            metadata |= self.schema.meta 
+        if self.schema is not None:
+            metadata |= self.schema.meta
         if meta:
             metadata |= meta  # Merge additional metadata if provided
 
         metadata_path.write_text(yaml.safe_dump(serialize(metadata), sort_keys=False))
+
+
+@dataclass
+class StreamingWriter:
+    """
+    Append-only writer for open-ended time-series data where the total number
+    of samples is not known in advance.
+
+    Arrays start at size 0 and grow along the time axis with each call to
+    append(). Samples are buffered in memory and flushed to disk in batches
+    of chunk_size to minimise the number of resize operations.
+
+    A '_time' array is always written alongside the data, storing Unix
+    timestamps (float64) for each sample.
+
+    Args:
+        root:        directory for vault.zarr and metadata.yaml
+        readouts:    dict mapping readout name to either its trailing shape
+                     (() for scalars, (N,) for traces, (H, W) for images) or a
+                     ReadoutSpecs, which also records unit, contains and
+                     trailing_dims (see ReadoutSpecs). A ReadoutSpecs name must
+                     match its key. Both forms can be mixed.
+                     Example: {"lockin_X": (), "S21": ReadoutSpecs("S21", DataKind.TRACE,
+                               shape=(1601,), unit="dBm",
+                               trailing_dims=[{"name": "freq", "unit": "Hz", "values": freqs}])}
+        chunk_size:  number of samples per chunk along the time axis.
+                     Also the buffer size — flush() is called automatically
+                     once this many samples have been buffered.
+        dtype:       numpy dtype for all data arrays (default "float32").
+        tags:        free-form tags written to metadata on close().
+        overwrite:   if True, an existing vault at root will be overwritten.
+    """
+
+    root: str | Path
+    readouts: dict[str, tuple | ReadoutSpecs]
+    chunk_size: int = 256
+    dtype: str = "float32"
+    tags: list[str] = field(default_factory=list)
+    overwrite: bool = False
+
+    _count: int = field(init=False, default=0)
+    _buf_time: list = field(init=False, default_factory=list)
+    _buf_data: dict = field(init=False, default_factory=dict)
+    _trailing: dict = field(init=False, default_factory=dict)
+
+    def __post_init__(self):
+        for name, r in self.readouts.items():
+            if isinstance(r, ReadoutSpecs) and r.name != name:
+                raise ValueError(f"readouts key '{name}' does not match ReadoutSpecs name '{r.name}'")
+        self._trailing = {
+            name: tuple(r.shape or ()) if isinstance(r, ReadoutSpecs) else tuple(r)
+            for name, r in self.readouts.items()
+        }
+
+        self.root = Path(self.root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.vault = zarr.group(str(self.root / "vault.zarr"))
+        self._buf_data = {name: [] for name in self.readouts}
+
+        # Timestamp coordinate array — always present
+        self.vault.create_array(
+            name="_time",
+            shape=(0,),
+            chunks=(self.chunk_size,),
+            dtype="float64",
+            overwrite=self.overwrite,
+        )
+
+        manifest = []
+        for name, trailing in self._trailing.items():
+            self.vault.create_array(
+                name=name,
+                shape=(0,) + trailing,
+                chunks=(self.chunk_size,) + trailing,
+                dtype=self.dtype,
+                overwrite=self.overwrite,
+            )
+            spec = self.readouts[name]
+            if isinstance(spec, ReadoutSpecs):
+                _write_trailing_coords(self.vault, spec, self.overwrite)
+                manifest.append(_readout_manifest(spec))
+            else:
+                manifest.append({
+                    "name": name, "kind": ("scalar", "trace", "image")[min(len(trailing), 2)],
+                    "shape": list(trailing), "unit": None, "contains": None, "trailing_dims": [],
+                })
+        self.vault.attrs["zarro"] = {"version": 2, "kind": "monitor", "axes": [], "readouts": manifest}
+
+    def append(self, data: dict, timestamp: float = None):
+        """Buffer one sample. Flushes to disk automatically when chunk_size is reached.
+
+        Args:
+            data:      dict mapping readout name to value (scalar, 1-D, or 2-D array).
+            timestamp: Unix timestamp for this sample. Defaults to datetime.now().
+        """
+        if timestamp is None:
+            timestamp = datetime.now().timestamp()
+        self._buf_time.append(timestamp)
+        for name, value in data.items():
+            self._buf_data[name].append(np.asarray(value, dtype=self.dtype))
+        if len(self._buf_time) >= self.chunk_size:
+            self.flush()
+
+    def flush(self):
+        """Write all buffered samples to disk in a single resize + write operation."""
+        n_new = len(self._buf_time)
+        if n_new == 0:
+            return
+        n_old = self._count
+        n_total = n_old + n_new
+
+        self.vault["_time"].resize((n_total,))
+        self.vault["_time"][n_old:n_total] = np.array(self._buf_time)
+
+        for name, samples in self._buf_data.items():
+            if not samples:
+                continue
+            arr = self.vault[name]
+            arr.resize((n_total,) + arr.shape[1:])
+            arr[n_old:n_total] = np.stack(samples)
+
+        self._count = n_total
+        self._buf_time = []
+        self._buf_data = {name: [] for name in self.readouts}
+
+    def close(self, meta: dict = None):
+        """Flush remaining buffered samples and write metadata.
+
+        Writes Zarr group attributes (JSON) and a metadata.yaml file,
+        consistent with the convention used by ZarrWriter.
+
+        Args:
+            meta: additional key-value pairs to include in the metadata.
+        """
+        self.flush()
+        metadata = {
+            "date":     datetime.now().isoformat(),
+            "count":    self._count,
+            "tags":     self.tags,
+            "readouts": {k: list(v) for k, v in self._trailing.items()},
+        }
+        if meta:
+            metadata |= meta
+        metadata = serialize(metadata)
+        self.vault.attrs.update(metadata)
+        (self.root / "metadata.yaml").write_text(yaml.safe_dump(metadata, sort_keys=False))
